@@ -75,9 +75,9 @@ defmodule Twitchy.MixProject do
   defp package do
     [
       name: "twitchy",
-      licenses: ["MIT"],
+      licenses: ["Apache-2.0"],
       links: %{
-        "GitHub" => "https://github.com/yourusername/twitchy"
+        "GitHub" => "https://github.com/joetjen/twitchy"
       }
     ]
   end
@@ -111,7 +111,13 @@ defmodule Twitchy.MixProject do
     [
       "test.unit": ["test --exclude integration"],
       "test.integration": ["test --only integration"],
-      "test.all": ["test --include integration"]
+      "test.all": ["test --include integration"],
+      precommit: [
+        "format --check-formatted",
+        "compile --warnings-as-errors",
+        "credo --strict",
+        "test"
+      ]
     ]
   end
 end
