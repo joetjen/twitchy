@@ -54,6 +54,7 @@ defmodule Twitchy.MixProject do
       # Configuration and utilities
       {:nimble_options, "~> 1.1"},
       {:telemetry, "~> 1.2"},
+      {:plug, "~> 1.14", optional: true},
 
       # Dev and test
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
@@ -85,6 +86,8 @@ defmodule Twitchy.MixProject do
   defp docs do
     [
       main: "readme",
+      source_url: "https://github.com/joetjen/twitchy",
+      homepage_url: "https://joetjen.github.io/twitchy",
       extras: [
         "README.md",
         "QUICKSTART.md",

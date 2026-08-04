@@ -4,6 +4,7 @@ A comprehensive, production-ready Elixir client for the Twitch Helix API with fu
 
 [![Hex.pm](https://img.shields.io/hexpm/v/twitchy.svg)](https://hex.pm/packages/twitchy)
 [![Documentation](https://img.shields.io/badge/docs-hexdocs-blue.svg)](https://hexdocs.pm/twitchy)
+[![Docs (main)](https://img.shields.io/badge/docs-main-blue.svg)](https://joetjen.github.io/twitchy)
 [![License](https://img.shields.io/hexpm/l/twitchy.svg)](LICENSE)
 
 ## Features
@@ -120,6 +121,7 @@ See [EVENTSUB_EXAMPLES.md](EVENTSUB_EXAMPLES.md) for comprehensive EventSub guid
 - [Examples](EXAMPLES.md)
 - [API Documentation](docs/api/)
 - [Testing Guide](TESTING_GUIDE.md)
+- [Generated docs (main branch)](https://joetjen.github.io/twitchy) / [Generated docs (latest release)](https://hexdocs.pm/twitchy)
 
 ## Requirements
 
@@ -128,4 +130,4 @@ See [EVENTSUB_EXAMPLES.md](EVENTSUB_EXAMPLES.md) for comprehensive EventSub guid
 
 ## License
 
-MIT License - see [LICENSE](LICENSE)
+Apache License 2.0 - see [LICENSE](LICENSE)

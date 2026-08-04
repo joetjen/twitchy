@@ -147,7 +147,9 @@ defmodule Twitchy do
       {:ok, client} = Twitchy.authenticate(client, :user_access, code: "auth_code_from_callback")
   """
   @spec authenticate(t(), auth_type(), keyword()) :: {:ok, t()} | {:error, Exception.t()}
-  def authenticate(%Config{} = client, :app_access, _opts \\ []) do
+  def authenticate(client, auth_type, opts \\ [])
+
+  def authenticate(%Config{} = client, :app_access, _opts) do
     Auth.get_app_access_token(client)
   end
 
