@@ -1,12 +1,17 @@
 defmodule Twitchy.AuthTest do
   use ExUnit.Case, async: true
 
-  alias Twitchy.{Auth, Config}
+  alias Twitchy.Auth
   import Twitchy.{TestHelpers, BypassHelpers}
 
   setup do
     bypass = Bypass.open()
-    client = test_client(%{base_url: "http://localhost:#{bypass.port}"})
+
+    client =
+      test_client(%{
+        base_url: "http://localhost:#{bypass.port}",
+        auth_base_url: "http://localhost:#{bypass.port}/oauth2"
+      })
 
     {:ok, bypass: bypass, client: client}
   end
@@ -23,12 +28,14 @@ defmodule Twitchy.AuthTest do
 
       assert {:ok, updated_client} = Auth.get_app_access_token(client)
       assert updated_client.access_token == "app_token_12345"
-      assert updated_client.token_type == "bearer"
+      assert updated_client.token_type == :app_access
     end
 
     test "returns error on failure", %{bypass: bypass, client: client} do
       Bypass.expect_once(bypass, "POST", "/oauth2/token", fn conn ->
-        Plug.Conn.resp(conn, 400, Jason.encode!(%{"message" => "Invalid client"}))
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(400, Jason.encode!(%{"message" => "Invalid client"}))
       end)
 
       assert {:error, _} = Auth.get_app_access_token(client)
@@ -70,7 +77,7 @@ defmodule Twitchy.AuthTest do
 
       response = %{
         "access_token" => "user_token_12345",
-        "expires_in" => 14400,
+        "expires_in" => 14_400,
         "token_type" => "bearer",
         "refresh_token" => "refresh_token_12345",
         "scope" => ["user:read:email"]
@@ -120,7 +127,7 @@ defmodule Twitchy.AuthTest do
 
       response = %{
         "access_token" => "new_token_12345",
-        "expires_in" => 14400,
+        "expires_in" => 14_400,
         "token_type" => "bearer",
         "refresh_token" => "new_refresh_token",
         "scope" => ["user:read:email"]

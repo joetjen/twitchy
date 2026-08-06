@@ -84,36 +84,30 @@ defmodule Twitchy.HTTP do
   @spec request(Config.t(), atom(), String.t(), keyword()) ::
           {:ok, map()} | {:error, Exception.t()}
   def request(%Config{} = config, method, path, opts \\ []) do
-    with :ok <- Config.validate(config, :api_call) do
-      metadata = %{
-        method: method,
-        endpoint: path,
-        client_id: config.client_id
-      }
+    case Config.validate(config, :api_call) do
+      :ok ->
+        metadata = %{
+          method: method,
+          endpoint: path,
+          client_id: config.client_id
+        }
 
-      :telemetry.span(
-        [:twitchy, :api, :request],
-        metadata,
-        fn ->
-          result = do_request(config, method, path, opts)
+        :telemetry.span(
+          [:twitchy, :api, :request],
+          metadata,
+          fn ->
+            result = do_request(config, method, path, opts)
+            {result, merge_result_metadata(result, metadata)}
+          end
+        )
 
-          metadata =
-            case result do
-              {:ok, response} ->
-                Map.merge(metadata, extract_metadata(response))
-
-              {:error, _} ->
-                metadata
-            end
-
-          {result, metadata}
-        end
-      )
-    else
       {:error, reason} ->
         {:error, %Error.ValidationError{message: reason}}
     end
   end
+
+  defp merge_result_metadata({:ok, response}, metadata), do: Map.merge(metadata, extract_metadata(response))
+  defp merge_result_metadata({:error, _}, metadata), do: metadata
 
   defp do_request(config, method, path, opts) do
     url = build_url(config.base_url, path)
@@ -211,10 +205,14 @@ defmodule Twitchy.HTTP do
     metadata
   end
 
+  defp extract_metadata(_response), do: %{status: 200}
+
   @doc """
   Builds query parameters from a keyword list or map.
 
-  Filters out nil values and converts atoms to strings.
+  Filters out nil values and converts atoms to strings. List values are expanded
+  into repeated `key=value` pairs (e.g. `id: ["1", "2"]` becomes `id=1&id=2`),
+  which is how the Twitch Helix API expects array parameters.
 
   ## Examples
 
@@ -223,14 +221,17 @@ defmodule Twitchy.HTTP do
 
       iex> Twitchy.HTTP.build_query(%{first: 20, after: "cursor"})
       [first: "20", after: "cursor"]
+
+      iex> Twitchy.HTTP.build_query(id: ["123", "456"])
+      [id: "123", id: "456"]
   """
   @spec build_query(keyword() | map()) :: keyword()
   def build_query(params) when is_list(params) do
     params
     |> Enum.reject(fn {_k, v} -> is_nil(v) end)
-    |> Enum.map(fn
-      {k, v} when is_list(v) -> {k, v}
-      {k, v} -> {k, to_string(v)}
+    |> Enum.flat_map(fn
+      {k, v} when is_list(v) -> Enum.map(v, &{k, to_string(&1)})
+      {k, v} -> [{k, to_string(v)}]
     end)
   end
 

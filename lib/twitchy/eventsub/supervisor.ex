@@ -29,6 +29,8 @@ defmodule Twitchy.EventSub.Supervisor do
 
   use Supervisor
 
+  alias Twitchy.EventSub.WebSocket
+
   @registry_name Twitchy.EventSub.Registry
   @supervisor_name Twitchy.EventSub.DynamicSupervisor
 
@@ -130,7 +132,7 @@ defmodule Twitchy.EventSub.Supervisor do
   @spec get_session_id(atom()) :: {:ok, String.t()} | {:error, :not_found | :not_connected}
   def get_session_id(name) do
     case whereis(name) do
-      {:ok, pid} -> Twitchy.EventSub.WebSocket.get_session_id(pid)
+      {:ok, pid} -> WebSocket.get_session_id(pid)
       error -> error
     end
   end
@@ -145,7 +147,7 @@ defmodule Twitchy.EventSub.Supervisor do
   @spec get_subscriptions(atom()) :: {:ok, [map()]} | {:error, :not_found}
   def get_subscriptions(name) do
     case whereis(name) do
-      {:ok, pid} -> Twitchy.EventSub.WebSocket.get_subscriptions(pid)
+      {:ok, pid} -> WebSocket.get_subscriptions(pid)
       error -> error
     end
   end

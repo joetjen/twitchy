@@ -52,9 +52,14 @@ defmodule Twitchy.BypassHelpers do
   """
   def expect_helix_delete(bypass, path, response \\ %{}, status \\ 204) do
     Bypass.expect_once(bypass, "DELETE", path, fn conn ->
-      conn
-      |> Plug.Conn.put_resp_content_type("application/json")
-      |> Plug.Conn.resp(status, Jason.encode!(response))
+      conn = Plug.Conn.put_resp_content_type(conn, "application/json")
+
+      # 204/304 responses must not include a body (RFC 7230 3.3).
+      if status in [204, 304] do
+        Plug.Conn.resp(conn, status, "")
+      else
+        Plug.Conn.resp(conn, status, Jason.encode!(response))
+      end
     end)
   end
 

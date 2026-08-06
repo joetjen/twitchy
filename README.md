@@ -79,18 +79,31 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed getting started guide.
 ```elixir
 # Start EventSub WebSocket
 {:ok, _pid} = Twitchy.EventSub.Supervisor.start_websocket(
+  name: :my_bot,
   client: client,
-  handler: MyApp.EventHandler
+  handler: {MyApp.EventHandler, :handle_event, []}
 )
 
-# Handle events
+# Handle events (the handler receives the raw EventSub WebSocket message)
 defmodule MyApp.EventHandler do
-  def handle_event("stream.online", event, _metadata) do
-    IO.puts("🔴 #{event["broadcaster_user_name"]} went live!")
+  def handle_event(%{"metadata" => %{"message_type" => "notification"}} = event, _opts) do
+    case get_in(event, ["payload", "subscription", "type"]) do
+      "stream.online" ->
+        broadcaster = get_in(event, ["payload", "event", "broadcaster_user_name"])
+        IO.puts("🔴 #{broadcaster} went live!")
+
+      _other ->
+        :ok
+    end
+
     :ok
   end
+
+  def handle_event(_event, _opts), do: :ok
 end
 ```
+
+See [TUTORIAL.md](TUTORIAL.md) for a complete, step-by-step walkthrough of subscribing to events and reacting to them.
 
 See [EVENTSUB_EXAMPLES.md](EVENTSUB_EXAMPLES.md) for comprehensive EventSub guide.
 
@@ -112,14 +125,15 @@ See [EVENTSUB_EXAMPLES.md](EVENTSUB_EXAMPLES.md) for comprehensive EventSub guid
 | `Twitchy.Polls` | Channel polls |
 | `Twitchy.EventSub` | Event subscriptions |
 
-[See all API modules →](docs/api/)
+[See all API modules →](docs/api/API_REFERENCE.md)
 
 ## Documentation
 
 - [Quick Start Guide](QUICKSTART.md)
+- [Tutorial: Building a Stream Alert & Moderation Bot](TUTORIAL.md)
 - [Usage Guide](USAGE_GUIDE.md)
 - [Examples](EXAMPLES.md)
-- [API Documentation](docs/api/)
+- [API Documentation](docs/api/API_REFERENCE.md)
 - [Testing Guide](TESTING_GUIDE.md)
 - [Generated docs (main branch)](https://joetjen.github.io/twitchy) / [Generated docs (latest release)](https://hexdocs.pm/twitchy)
 
@@ -130,4 +144,4 @@ See [EVENTSUB_EXAMPLES.md](EVENTSUB_EXAMPLES.md) for comprehensive EventSub guid
 
 ## License
 
-Apache License 2.0 - see [LICENSE](LICENSE)
+MIT License - see [LICENSE](LICENSE)

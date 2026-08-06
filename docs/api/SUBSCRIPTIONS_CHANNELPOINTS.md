@@ -88,7 +88,7 @@ Update an existing reward.
 Remove a Channel Points reward.
 
 ```elixir
-{:ok, _} = Twitchy.ChannelPoints.delete_custom_reward(client,
+:ok = Twitchy.ChannelPoints.delete_custom_reward(client,
   broadcaster_id: "123456",
   id: "reward_id"
 )
@@ -137,7 +137,7 @@ Mark redemptions as fulfilled or canceled.
 
 ```elixir
 # Fulfill redemption
-{:ok, response} = Twitchy.ChannelPoints.update_redemption_status(client,
+:ok = Twitchy.ChannelPoints.update_redemption_status(client,
   broadcaster_id: "123456",
   reward_id: "reward_id",
   id: ["redemption_id_1", "redemption_id_2"],
@@ -145,7 +145,7 @@ Mark redemptions as fulfilled or canceled.
 )
 
 # Cancel redemption (refunds points)
-{:ok, response} = Twitchy.ChannelPoints.update_redemption_status(client,
+:ok = Twitchy.ChannelPoints.update_redemption_status(client,
   broadcaster_id: "123456",
   reward_id: "reward_id",
   id: ["redemption_id_3"],
@@ -524,6 +524,277 @@ defmodule MyApp.SubAnalytics do
 end
 ```
 
+## Tutorial
+
+### Build a Subscriber & Rewards Dashboard
+
+Two chores tend to eat a broadcaster's time between streams: checking who's
+subscribed (often to gate a sub-only giveaway) and clearing out a backlog of
+channel points redemptions that piled up while nobody was watching the
+queue. This tutorial builds a small **Subscriber & Rewards Dashboard** that
+handles both: it pulls the current subscriber count and list via
+`Twitchy.Subscriptions.get_broadcaster_subscriptions/2`, checks whether a
+specific viewer is subscribed via
+`Twitchy.Subscriptions.check_user_subscription/2`, and then clears a backlog
+of unfulfilled redemptions in bulk with
+`Twitchy.ChannelPoints.get_custom_reward_redemptions/2` (or
+`Twitchy.ChannelPoints.stream_redemptions/2` for paging through a large
+queue) followed by `Twitchy.ChannelPoints.update_redemption_status/2`.
+
+**Prerequisites:** this tutorial needs a **user access token** for the
+broadcaster, authorized with `channel:read:subscriptions` (subscriber
+count/list), `user:read:subscriptions` (checking a single viewer),
+`channel:read:redemptions` or `channel:manage:redemptions` (listing
+redemptions), and `channel:manage:redemptions` (updating redemption status).
+See
+[TUTORIAL.md](../../TUTORIAL.md#step-2-get-a-user-access-token-for-the-broadcaster)
+for how to obtain one.
+
+### Step 1: Fetch the Subscriber Count and List
+
+`get_broadcaster_subscriptions/2` returns up to one page of subscribers
+(`:first`, max 100), but the response's `"total"` and `"points"` fields
+always reflect the *whole* channel regardless of how many rows came back on
+this page — so a single call is enough for a dashboard header:
+
+```elixir
+{:ok, response} =
+  Twitchy.Subscriptions.get_broadcaster_subscriptions(client,
+    broadcaster_id: broadcaster_id,
+    first: 100
+  )
+
+IO.puts("Subscribers: #{response["total"]} (#{response["points"]} points)")
+
+Enum.each(response["data"], fn sub ->
+  IO.puts("  #{sub["user_name"]} - Tier #{sub["tier"]}")
+end)
+```
+
+If the channel has more than 100 subscribers and the dashboard needs the
+*full* list rather than just the total, page through it lazily with
+`stream_subscriptions/2` instead:
+
+```elixir
+all_subs =
+  client
+  |> Twitchy.Subscriptions.stream_subscriptions(broadcaster_id: broadcaster_id)
+  |> Enum.to_list()
+```
+
+### Step 2: Gate a Giveaway on Subscription Status
+
+`check_user_subscription/2` takes a single `:user_id` (not a list) alongside
+`:broadcaster_id`. When the viewer *is* subscribed, the response's `"data"`
+holds one entry; when they aren't, Twitch's API responds with a 404, which
+Twitchy normalizes into `%Twitchy.Error.APIError{status: 404}` rather than an
+`{:ok, ...}` tuple — so that specific error is the "not eligible" case, and
+every other error still needs to propagate:
+
+```elixir
+defp subscriber?(client, broadcaster_id, user_id) do
+  case Twitchy.Subscriptions.check_user_subscription(client,
+         broadcaster_id: broadcaster_id,
+         user_id: user_id
+       ) do
+    {:ok, %{"data" => [_sub | _]}} ->
+      true
+
+    {:error, %Twitchy.Error.APIError{status: 404}} ->
+      false
+
+    {:error, error} ->
+      raise error
+  end
+end
+```
+
+With that in place, gating a sub-only giveaway is a one-liner:
+
+```elixir
+if subscriber?(client, broadcaster_id, viewer_id) do
+  IO.puts("You're in! Good luck.")
+else
+  IO.puts("Sorry, this giveaway is for subscribers only.")
+end
+```
+
+### Step 3: List the Unfulfilled Redemption Backlog
+
+`get_custom_reward_redemptions/2` requires both `:broadcaster_id` and
+`:reward_id` — redemptions always belong to one specific reward — and
+returns up to one page (`:first`, max 50):
+
+```elixir
+{:ok, response} =
+  Twitchy.ChannelPoints.get_custom_reward_redemptions(client,
+    broadcaster_id: broadcaster_id,
+    reward_id: reward_id,
+    status: :UNFULFILLED,
+    first: 50
+  )
+
+redemptions = response["data"]
+IO.puts("#{length(redemptions)} redemption(s) waiting")
+```
+
+A backlog that built up over days can easily be bigger than one page.
+`stream_redemptions/2` takes the same filter params but lazily walks every
+page, so `Enum.to_list/1` (or any other `Enum`/`Stream` call) pulls the
+entire backlog without hand-written cursor tracking:
+
+```elixir
+backlog =
+  client
+  |> Twitchy.ChannelPoints.stream_redemptions(
+    broadcaster_id: broadcaster_id,
+    reward_id: reward_id,
+    status: :UNFULFILLED
+  )
+  |> Enum.to_list()
+```
+
+### Step 4: Bulk-Fulfill Redemptions in Batches of 50
+
+`update_redemption_status/2` accepts up to 50 redemption `:id`s per call and
+returns plain `:ok` (not `{:ok, _}`) on success, so a backlog larger than 50
+has to be chunked and fulfilled one batch at a time:
+
+```elixir
+defp fulfill_all(client, broadcaster_id, reward_id, redemptions) do
+  redemptions
+  |> Enum.map(& &1["id"])
+  |> Enum.chunk_every(50)
+  |> Enum.each(fn batch ->
+    :ok =
+      Twitchy.ChannelPoints.update_redemption_status(client,
+        broadcaster_id: broadcaster_id,
+        reward_id: reward_id,
+        id: batch,
+        status: "FULFILLED"
+      )
+  end)
+end
+```
+
+`status: "CANCELED"` works the same way and automatically refunds the
+viewer's points — useful when the backlog includes redemptions that can no
+longer be honored (a song request for a stream that already ended, say).
+
+### The Complete Example
+
+Putting Steps 1-4 together as a small module a broadcaster (or a `mix run
+-e` one-liner) can call between streams — print the dashboard, check one
+viewer's eligibility, and clear the backlog for a given reward:
+
+```elixir
+defmodule MyApp.SubscriberRewardsDashboard do
+  @moduledoc """
+  Prints a subscriber summary, checks a single viewer's subscription
+  status, and bulk-fulfills a channel points redemption backlog.
+  """
+
+  require Logger
+
+  @doc """
+  Prints the current subscriber count, point total, and roster.
+  """
+  @spec print_subscriber_summary(Twitchy.t(), String.t()) :: :ok
+  def print_subscriber_summary(client, broadcaster_id) do
+    case Twitchy.Subscriptions.get_broadcaster_subscriptions(client,
+           broadcaster_id: broadcaster_id,
+           first: 100
+         ) do
+      {:ok, response} ->
+        IO.puts("Subscribers: #{response["total"]} (#{response["points"]} points)")
+
+        Enum.each(response["data"], fn sub ->
+          IO.puts("  #{sub["user_name"]} - Tier #{sub["tier"]}")
+        end)
+
+        :ok
+
+      {:error, error} ->
+        Logger.error("Failed to fetch subscriptions: #{Exception.message(error)}")
+        :ok
+    end
+  end
+
+  @doc """
+  Returns `true` if `user_id` is currently subscribed to `broadcaster_id`.
+  """
+  @spec subscriber?(Twitchy.t(), String.t(), String.t()) :: boolean()
+  def subscriber?(client, broadcaster_id, user_id) do
+    case Twitchy.Subscriptions.check_user_subscription(client,
+           broadcaster_id: broadcaster_id,
+           user_id: user_id
+         ) do
+      {:ok, %{"data" => [_sub | _]}} ->
+        true
+
+      {:error, %Twitchy.Error.APIError{status: 404}} ->
+        false
+
+      {:error, error} ->
+        Logger.warning("Subscription check failed: #{Exception.message(error)}")
+        false
+    end
+  end
+
+  @doc """
+  Fetches every unfulfilled redemption for `reward_id` and marks it
+  fulfilled, 50 at a time. Returns the number of redemptions processed.
+  """
+  @spec fulfill_redemption_backlog(Twitchy.t(), String.t(), String.t()) :: non_neg_integer()
+  def fulfill_redemption_backlog(client, broadcaster_id, reward_id) do
+    redemptions =
+      client
+      |> Twitchy.ChannelPoints.stream_redemptions(
+        broadcaster_id: broadcaster_id,
+        reward_id: reward_id,
+        status: :UNFULFILLED
+      )
+      |> Enum.to_list()
+
+    redemptions
+    |> Enum.map(& &1["id"])
+    |> Enum.chunk_every(50)
+    |> Enum.each(fn batch -> fulfill_batch(client, broadcaster_id, reward_id, batch) end)
+
+    IO.puts("Fulfilled #{length(redemptions)} redemption(s)")
+    length(redemptions)
+  end
+
+  defp fulfill_batch(client, broadcaster_id, reward_id, batch) do
+    case Twitchy.ChannelPoints.update_redemption_status(client,
+           broadcaster_id: broadcaster_id,
+           reward_id: reward_id,
+           id: batch,
+           status: "FULFILLED"
+         ) do
+      :ok ->
+        :ok
+
+      {:error, error} ->
+        Logger.error("Failed to fulfill batch #{inspect(batch)}: #{Exception.message(error)}")
+    end
+  end
+end
+
+# Usage
+{:ok, client} =
+  Twitchy.new(client_id: "your_client_id", client_secret: "your_client_secret")
+  |> Twitchy.authenticate(:user_access, code: "abcdef123456")
+
+MyApp.SubscriberRewardsDashboard.print_subscriber_summary(client, "123456")
+
+if MyApp.SubscriberRewardsDashboard.subscriber?(client, "123456", "789") do
+  IO.puts("Viewer 789 is eligible for the giveaway")
+end
+
+MyApp.SubscriberRewardsDashboard.fulfill_redemption_backlog(client, "123456", "reward_id")
+```
+
 ## Best Practices
 
 1. **Cache subscriber list** - Don't query for each permission check
@@ -537,6 +808,6 @@ end
 ## See Also
 
 - [Chat & Moderation API](CHAT_MODERATION.md)
-- [Predictions & Polls API](PREDICTIONS_POLLS.md)
+- [Predictions, Polls & Hype Train API](PREDICTIONS_POLLS_HYPETRAIN.md)
 - [EventSub Examples](../../EVENTSUB_EXAMPLES.md)
 - [Usage Guide](../../USAGE_GUIDE.md)

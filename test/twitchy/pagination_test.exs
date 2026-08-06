@@ -3,8 +3,74 @@ defmodule Twitchy.PaginationTest do
 
   alias Twitchy.Pagination
 
-  # Note: stream/2 implementation requires checking - tests commented out for now
-  # TODO: Implement correct stream tests based on actual Pagination module API
+  describe "stream/2" do
+    test "fetches the first page even with the default nil cursor" do
+      pages = %{
+        nil => {:ok, [1, 2], "cursor1"},
+        "cursor1" => {:ok, [3, 4], "cursor2"},
+        "cursor2" => {:ok, [5], nil}
+      }
+
+      fetch_fn = fn cursor -> Map.fetch!(pages, cursor) end
+
+      assert Pagination.stream(fetch_fn) |> Enum.to_list() == [1, 2, 3, 4, 5]
+    end
+
+    test "starts from the given initial cursor" do
+      fetch_fn = fn
+        "start_cursor" -> {:ok, [1], nil}
+      end
+
+      assert Pagination.stream(fetch_fn, "start_cursor") |> Enum.to_list() == [1]
+    end
+
+    test "halts once a page returns no items" do
+      fetch_fn = fn
+        nil -> {:ok, [1, 2], "cursor1"}
+        "cursor1" -> {:ok, [], "cursor2"}
+      end
+
+      assert Pagination.stream(fetch_fn) |> Enum.to_list() == [1, 2]
+    end
+
+    test "raises when fetch_page_fn returns an error" do
+      fetch_fn = fn nil -> {:error, :boom} end
+
+      assert_raise RuntimeError, ~r/Pagination error/, fn ->
+        Pagination.stream(fetch_fn) |> Enum.to_list()
+      end
+    end
+
+    test "works lazily with Enum.take/2 without fetching extra pages" do
+      pages = %{
+        nil => {:ok, [1, 2], "cursor1"},
+        "cursor1" => {:ok, [3, 4], "cursor2"}
+      }
+
+      fetch_fn = fn cursor -> Map.fetch!(pages, cursor) end
+
+      assert Pagination.stream(fetch_fn) |> Enum.take(3) == [1, 2, 3]
+    end
+  end
+
+  describe "fetch_all/2" do
+    test "collects all pages into a single list" do
+      pages = %{
+        nil => {:ok, [1, 2], "cursor1"},
+        "cursor1" => {:ok, [3], nil}
+      }
+
+      fetch_fn = fn cursor -> Map.fetch!(pages, cursor) end
+
+      assert Pagination.fetch_all(fetch_fn) == {:ok, [1, 2, 3]}
+    end
+
+    test "returns an error tuple instead of raising when fetching fails" do
+      fetch_fn = fn nil -> {:error, :boom} end
+
+      assert {:error, %RuntimeError{}} = Pagination.fetch_all(fetch_fn)
+    end
+  end
 
   describe "add_to_query/2" do
     test "adds pagination params to query" do

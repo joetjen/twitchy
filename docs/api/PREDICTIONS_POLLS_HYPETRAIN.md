@@ -571,6 +571,318 @@ defmodule MyApp.HypeTrainMonitor do
 end
 ```
 
+## Tutorial
+
+### Building an Interactive Stream Events Announcer
+
+This walkthrough builds a small script that turns a match into an interactive
+segment for chat: it opens a Channel Points Prediction on whether the
+broadcaster wins, resolves that Prediction once the match is over, hands off
+to a Poll so chat decides what happens next, and checks in on the Hype Train
+while all of that is happening. Each step below adds one function; the final
+module puts them all together into something you can copy into a project and
+call from `iex`.
+
+Everything here needs a **user access token** for the broadcaster, authorized
+with:
+
+- `channel:manage:predictions` — create and resolve Predictions
+- `channel:manage:polls` — create and end Polls
+- `channel:read:hype_train` — read Hype Train status
+
+See [TUTORIAL.md](../../TUTORIAL.md#step-2-get-a-user-access-token-for-the-broadcaster)
+for how to walk through the OAuth flow and get that token; the rest of this
+guide assumes you already have an authenticated `client` and the
+broadcaster's `broadcaster_id`.
+
+### Step 1: Start the Prediction
+
+Kick things off by asking viewers to call the outcome. `create_prediction/2`
+returns the created Prediction, including its `"outcomes"` — hang onto that
+list, since each outcome's `"id"` is what you'll need later to resolve it:
+
+```elixir
+{:ok, %{"data" => [prediction | _]}} =
+  Twitchy.Predictions.create_prediction(client,
+    broadcaster_id: broadcaster_id,
+    title: "Will I win this match?",
+    outcomes: [
+      %{title: "Yes"},
+      %{title: "No"}
+    ],
+    prediction_window: 300
+  )
+
+IO.puts("🎲 Prediction live: #{prediction["title"]}")
+```
+
+### Step 2: Resolve the Prediction
+
+Once the match ends, find the outcome that matches what actually happened and
+resolve the Prediction with `end_prediction/2`. Passing `status: "RESOLVED"`
+pays out everyone who backed the winning outcome; if the match got called off
+entirely, `status: "CANCELED"` refunds everyone instead:
+
+```elixir
+winning_outcome = Enum.find(prediction["outcomes"], &(&1["title"] == "Yes"))
+
+{:ok, _response} =
+  Twitchy.Predictions.end_prediction(client,
+    broadcaster_id: broadcaster_id,
+    id: prediction["id"],
+    status: "RESOLVED",
+    winning_outcome_id: winning_outcome["id"]
+  )
+
+IO.puts("✅ Prediction resolved: #{winning_outcome["title"]} won!")
+```
+
+If the script restarted between Step 1 and Step 2 and you no longer have
+`prediction` in hand, `get_predictions/2` looks it up by ID:
+
+```elixir
+{:ok, %{"data" => [prediction | _]}} =
+  Twitchy.Predictions.get_predictions(client,
+    broadcaster_id: broadcaster_id,
+    id: prediction_id
+  )
+```
+
+### Step 3: Ask Chat What's Next
+
+With the Prediction settled, open a Poll so chat decides the next move.
+`create_poll/2` takes the same `choices`/`title` shape as `outcomes` above —
+a list of maps with a `:title` key — plus a `:duration` and, optionally,
+Channel Points voting:
+
+```elixir
+{:ok, %{"data" => [poll | _]}} =
+  Twitchy.Polls.create_poll(client,
+    broadcaster_id: broadcaster_id,
+    title: "What should I do next?",
+    choices: [
+      %{title: "Run it back"},
+      %{title: "Try a different game"},
+      %{title: "Take a break"}
+    ],
+    duration: 120,
+    channel_points_voting_enabled: true,
+    channel_points_per_vote: 50
+  )
+
+IO.puts("📊 Poll live: #{poll["title"]}")
+```
+
+### Step 4: End the Poll and Announce the Winner
+
+Let the poll run for its `duration`, or cut it short with `end_poll/2` once
+chat has clearly made up its mind. Either way, the response's `"choices"`
+list carries each option's final `"votes"` count:
+
+```elixir
+{:ok, %{"data" => [ended_poll | _]}} =
+  Twitchy.Polls.end_poll(client,
+    broadcaster_id: broadcaster_id,
+    id: poll["id"],
+    status: "TERMINATED"
+  )
+
+winner = Enum.max_by(ended_poll["choices"], & &1["votes"])
+IO.puts("🏆 Chat picked: #{winner["title"]} (#{winner["votes"]} votes)")
+```
+
+### Step 5: Watch the Hype Train
+
+While the Prediction and Poll are running, viewers might also kick off a Hype
+Train. `get_hype_train_events/2` with `first: 1` gets just the most recent
+event, which is enough to track whether a train is currently active and what
+level it's at:
+
+```elixir
+{:ok, %{"data" => data}} =
+  Twitchy.HypeTrain.get_hype_train_events(client, broadcaster_id: broadcaster_id, first: 1)
+
+case data do
+  [event | _] ->
+    IO.puts("🚂 Hype Train Level #{event["level"]}: #{event["progress"]}/#{event["goal"]}")
+
+  [] ->
+    IO.puts("No active Hype Train.")
+end
+```
+
+Checking that periodically — every 15-30 seconds while your stream events are
+running — is enough to announce each level-up as it happens; the complete
+example below wraps this in a small recursive loop. If you instead need the
+full history of past Hype Trains rather than just the latest one,
+`stream_events/2` pages through all of them lazily:
+
+```elixir
+events =
+  client
+  |> Twitchy.HypeTrain.stream_events(broadcaster_id: broadcaster_id)
+  |> Enum.to_list()
+```
+
+### The Complete Example
+
+Everything above, assembled into one module. Drop this into
+`lib/my_app/events_announcer.ex` in a project with `:twitchy` as a
+dependency, then drive it a few functions at a time from `iex -S mix`.
+
+```elixir
+defmodule MyApp.EventsAnnouncer do
+  @moduledoc """
+  Runs a Channel Points Prediction, follows it with a chat Poll, and
+  periodically reports Hype Train progress — a minimal "interactive stream
+  events" script built on `Twitchy.Predictions`, `Twitchy.Polls`, and
+  `Twitchy.HypeTrain`.
+  """
+
+  require Logger
+
+  @doc """
+  Starts a Prediction asking whether the broadcaster will win. Returns
+  `{:ok, prediction}`, including `"outcomes"` so you can resolve it later.
+  """
+  def start_win_prediction(client, broadcaster_id) do
+    case Twitchy.Predictions.create_prediction(client,
+           broadcaster_id: broadcaster_id,
+           title: "Will I win this match?",
+           outcomes: [%{title: "Yes"}, %{title: "No"}],
+           prediction_window: 300
+         ) do
+      {:ok, %{"data" => [prediction | _]}} ->
+        IO.puts("🎲 Prediction live: #{prediction["title"]}")
+        {:ok, prediction}
+
+      {:error, error} ->
+        Logger.error("Failed to start prediction: #{Exception.message(error)}")
+        {:error, error}
+    end
+  end
+
+  @doc """
+  Resolves a Prediction. `outcomes` is the list from the prediction returned
+  by `start_win_prediction/2`; `winning_title` picks which one paid out.
+  """
+  def resolve_prediction(client, broadcaster_id, prediction_id, outcomes, winning_title) do
+    case Enum.find(outcomes, &(&1["title"] == winning_title)) do
+      %{"id" => winning_outcome_id} ->
+        case Twitchy.Predictions.end_prediction(client,
+               broadcaster_id: broadcaster_id,
+               id: prediction_id,
+               status: "RESOLVED",
+               winning_outcome_id: winning_outcome_id
+             ) do
+          {:ok, _response} ->
+            IO.puts("✅ Prediction resolved: #{winning_title} won!")
+            :ok
+
+          {:error, error} ->
+            Logger.error("Failed to resolve prediction: #{Exception.message(error)}")
+            {:error, error}
+        end
+
+      nil ->
+        {:error, :outcome_not_found}
+    end
+  end
+
+  @doc """
+  Launches the "what happens next" Poll for chat to vote on.
+  """
+  def start_next_poll(client, broadcaster_id) do
+    case Twitchy.Polls.create_poll(client,
+           broadcaster_id: broadcaster_id,
+           title: "What should I do next?",
+           choices: [
+             %{title: "Run it back"},
+             %{title: "Try a different game"},
+             %{title: "Take a break"}
+           ],
+           duration: 120,
+           channel_points_voting_enabled: true,
+           channel_points_per_vote: 50
+         ) do
+      {:ok, %{"data" => [poll | _]}} ->
+        IO.puts("📊 Poll live: #{poll["title"]}")
+        {:ok, poll}
+
+      {:error, error} ->
+        Logger.error("Failed to start poll: #{Exception.message(error)}")
+        {:error, error}
+    end
+  end
+
+  @doc """
+  Terminates the poll early and reports the winning choice.
+  """
+  def end_poll_and_announce(client, broadcaster_id, poll_id) do
+    case Twitchy.Polls.end_poll(client,
+           broadcaster_id: broadcaster_id,
+           id: poll_id,
+           status: "TERMINATED"
+         ) do
+      {:ok, %{"data" => [poll | _]}} ->
+        winner = Enum.max_by(poll["choices"], & &1["votes"])
+        IO.puts("🏆 Chat picked: #{winner["title"]} (#{winner["votes"]} votes)")
+        {:ok, winner}
+
+      {:error, error} ->
+        Logger.error("Failed to end poll: #{Exception.message(error)}")
+        {:error, error}
+    end
+  end
+
+  @doc """
+  Polls `get_hype_train_events/2` every `interval_ms` and prints progress
+  whenever the level changes, stopping once no Hype Train is active. Run
+  this inside a `Task` so it doesn't block the rest of your script.
+  """
+  def watch_hype_train(client, broadcaster_id, interval_ms \\ 15_000, last_level \\ nil) do
+    case Twitchy.HypeTrain.get_hype_train_events(client,
+           broadcaster_id: broadcaster_id,
+           first: 1
+         ) do
+      {:ok, %{"data" => [event | _]}} ->
+        if event["level"] != last_level do
+          IO.puts("🚂 Hype Train Level #{event["level"]}: #{event["progress"]}/#{event["goal"]}")
+        end
+
+        Process.sleep(interval_ms)
+        watch_hype_train(client, broadcaster_id, interval_ms, event["level"])
+
+      {:ok, %{"data" => []}} ->
+        IO.puts("No active Hype Train.")
+        :ok
+
+      {:error, error} ->
+        Logger.error("Failed to check Hype Train: #{Exception.message(error)}")
+        {:error, error}
+    end
+  end
+end
+```
+
+Wire it together from `iex -S mix`:
+
+```elixir
+{:ok, task} = Task.start_link(fn -> MyApp.EventsAnnouncer.watch_hype_train(client, broadcaster_id) end)
+
+{:ok, prediction} = MyApp.EventsAnnouncer.start_win_prediction(client, broadcaster_id)
+
+# ... match happens ...
+:ok = MyApp.EventsAnnouncer.resolve_prediction(client, broadcaster_id, prediction["id"], prediction["outcomes"], "Yes")
+
+{:ok, poll} = MyApp.EventsAnnouncer.start_next_poll(client, broadcaster_id)
+
+# ... let chat vote for a bit ...
+{:ok, _winner} = MyApp.EventsAnnouncer.end_poll_and_announce(client, broadcaster_id, poll["id"])
+
+Task.shutdown(task)
+```
+
 ## Best Practices
 
 1. **Auto-close predictions** - Set reasonable time windows

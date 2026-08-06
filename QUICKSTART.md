@@ -82,32 +82,46 @@ end)
 ```elixir
 # Start EventSub WebSocket connection
 {:ok, _pid} = Twitchy.EventSub.Declarative.start_link(
+  name: :my_bot,
   client: client,
-  handler: MyApp.EventHandler,
+  handler: {MyApp.EventHandler, :handle_event, []},
   subscriptions: [
     %{
       type: "stream.online",
-      condition: %{"broadcaster_user_id" => "123456"}
+      version: "1",
+      condition: %{broadcaster_user_id: "123456"}
     }
   ]
 )
 
-# Handle events
+# Handle events (the handler receives the raw EventSub WebSocket message)
 defmodule MyApp.EventHandler do
-  def handle_event("stream.online", event, _metadata) do
-    IO.puts("🔴 #{event["broadcaster_user_name"]} went live!")
+  def handle_event(%{"metadata" => %{"message_type" => "notification"}} = event, _opts) do
+    case get_in(event, ["payload", "subscription", "type"]) do
+      "stream.online" ->
+        broadcaster = get_in(event, ["payload", "event", "broadcaster_user_name"])
+        IO.puts("🔴 #{broadcaster} went live!")
+
+      _other ->
+        :ok
+    end
+
     :ok
   end
 
-  def handle_event(_type, _event, _metadata), do: :ok
+  def handle_event(_event, _opts), do: :ok
 end
 ```
 
+See [TUTORIAL.md](TUTORIAL.md) for a full, step-by-step walkthrough that builds
+on this into a complete stream alert & moderation bot.
+
 ## Next Steps
 
+- **[Tutorial](TUTORIAL.md)** - Step-by-step build of a complete stream alert & moderation bot
 - **[Usage Guide](USAGE_GUIDE.md)** - Comprehensive guide covering all features
 - **[Examples](EXAMPLES.md)** - Real-world applications and patterns
-- **[API Documentation](docs/api/)** - Detailed API module documentation
+- **[API Documentation](docs/api/API_REFERENCE.md)** - Detailed API module documentation
 - **[EventSub Guide](EVENTSUB_EXAMPLES.md)** - Real-time events examples
 - **[Testing Guide](TESTING_GUIDE.md)** - How to test your applications
 

@@ -13,7 +13,7 @@ Get videos (VODs, uploads, archives, highlights) from a broadcaster.
 {:ok, response} = Twitchy.Videos.get_videos(client,
   user_id: "123456",
   first: 20,
-  type: "archive"  # "archive", "highlight", "upload"
+  type: :archive  # :archive, :highlight, :upload, :all
 )
 
 Enum.each(response["data"], fn video ->
@@ -30,9 +30,9 @@ Delete videos from your channel (requires `channel:manage:videos` scope).
 
 ```elixir
 # Delete one or more videos
-{:ok, response} = Twitchy.Videos.delete_videos(client, id: ["12345", "67890"])
+:ok = Twitchy.Videos.delete_videos(client, id: ["12345", "67890"])
 
-IO.puts("Deleted videos: #{inspect(response)}")
+IO.puts("Videos deleted.")
 ```
 
 ## Clips API
@@ -394,6 +394,271 @@ Enum.take(clips, 10) |> Enum.each(fn %{clip: clip, score: score} ->
   IO.puts("  By: #{clip["creator_name"]} | Views: #{clip["view_count"]}")
   IO.puts("  #{clip["url"]}")
 end)
+```
+
+## Tutorial
+
+This tutorial builds a **Weekly Highlights Digest**: a script that pulls a
+channel's recent VODs from the past week alongside that week's most-viewed
+clips, and formats both into a short plain-text report you can paste straight
+into a Discord announcement. It's a realistic use of the Videos and Clips APIs
+together — VODs tell viewers what they missed, clips show the best moments
+from it. A bonus step at the end shows how to programmatically create a clip
+while the channel is live.
+
+### Step 1: Resolve the Broadcaster's User ID
+
+Both the Videos and Clips APIs key off a numeric user ID, not a channel login
+name, so the first step is always the same: look it up once and pass it
+through everything else.
+
+```elixir
+{:ok, broadcaster} = Twitchy.Users.get_user(client, login: "your_channel_name")
+broadcaster_id = broadcaster["id"]
+```
+
+An app access token is enough for everything through Step 4 — no user login
+required yet. Only the bonus clip-creation step needs a user token.
+
+### Step 2: Pull the Past Week's VODs
+
+`Twitchy.Videos.get_videos/2` accepts a `:period` filter (`:all`, `:day`,
+`:week`, `:month`) alongside `:user_id`, so asking for archived broadcasts
+from the last week is a single call — no manual date math needed:
+
+```elixir
+{:ok, %{"data" => videos}} =
+  Twitchy.Videos.get_videos(client,
+    user_id: broadcaster_id,
+    type: :archive,
+    period: :week,
+    sort: :time,
+    first: 20
+  )
+
+Enum.each(videos, fn video ->
+  IO.puts("#{video["title"]} (#{video["view_count"]} views) — #{video["url"]}")
+end)
+```
+
+`type: :archive` excludes highlights and uploads so the digest only reports
+actual stream VODs; `sort: :time` puts the newest broadcast first.
+
+### Step 3: Pull the Week's Top Clips
+
+Clips don't have a `:period` shortcut, but `get_clips/2` takes explicit
+`:started_at`/`:ended_at` timestamps (RFC3339), which cover the same week:
+
+```elixir
+started_at = DateTime.utc_now() |> DateTime.add(-7, :day) |> DateTime.to_iso8601()
+ended_at = DateTime.utc_now() |> DateTime.to_iso8601()
+
+{:ok, %{"data" => clips}} =
+  Twitchy.Clips.get_clips(client,
+    broadcaster_id: broadcaster_id,
+    started_at: started_at,
+    ended_at: ended_at,
+    first: 100
+  )
+
+top_clips =
+  clips
+  |> Enum.sort_by(& &1["view_count"], :desc)
+  |> Enum.take(5)
+```
+
+`get_clips/2` only returns a single page (up to `first: 100`). For a very
+clip-heavy channel where a week's clips could exceed 100, swap in
+`Twitchy.Clips.stream_clips/2` instead — it paginates lazily, so you can pull
+every clip in the window before sorting:
+
+```elixir
+top_clips =
+  client
+  |> Twitchy.Clips.stream_clips(
+    broadcaster_id: broadcaster_id,
+    started_at: started_at,
+    ended_at: ended_at
+  )
+  |> Enum.to_list()
+  |> Enum.sort_by(& &1["view_count"], :desc)
+  |> Enum.take(5)
+```
+
+### Step 4: Format a Shareable Report
+
+With both lists in hand, assembling the digest is plain string formatting —
+nothing Twitchy-specific:
+
+```elixir
+report = """
+**#{broadcaster["display_name"]}'s Weekly Highlights**
+
+**VODs this week**
+#{Enum.map_join(videos, "\n", &"- #{&1["title"]} (#{&1["view_count"]} views) — #{&1["url"]}")}
+
+**Top clips this week**
+#{Enum.map_join(top_clips, "\n", &"- #{&1["title"]} by #{&1["creator_name"]} (#{&1["view_count"]} views) — #{&1["url"]}")}
+"""
+
+IO.puts(report)
+```
+
+That's a complete digest, ready to paste into a Discord channel or pipe to a
+webhook.
+
+### Step 5 (Bonus): Create a Clip While Live
+
+`Twitchy.Clips.create_clip/2` requests a clip of the broadcaster's *current*
+stream — it only works while the channel is live, and it requires the
+`clips:edit` scope on a user access token (an app access token can't call it):
+
+```elixir
+{:ok, %{"data" => [%{"id" => clip_id, "edit_url" => edit_url}]}} =
+  Twitchy.Clips.create_clip(user_client, broadcaster_id: broadcaster_id)
+
+IO.puts("Clip requested! Finish editing at: #{edit_url}")
+```
+
+Two things to keep in mind: if the channel isn't live, `create_clip/2` returns
+an error rather than a clip. And even when it succeeds, Twitch needs a few
+seconds to finish processing the clip — calling `get_clip/2` with the new
+`clip_id` immediately after tends to return `{:ok, nil}`. Give it a moment (or
+poll a few times with a short delay) before you rely on it being fetchable, as
+shown in the complete example below.
+
+### The Complete Example
+
+```elixir
+defmodule MyApp.WeeklyDigest do
+  @moduledoc """
+  Builds a "Weekly Highlights Digest": a broadcaster's VODs from the past
+  week and their most-viewed clips from the same period, formatted as a
+  plain-text report ready to paste into Discord.
+  """
+
+  @top_clip_count 5
+
+  @doc """
+  Builds the digest for `broadcaster_login` and returns it as text.
+  """
+  @spec build(Twitchy.t(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  def build(client, broadcaster_login) do
+    with {:ok, broadcaster} <- Twitchy.Users.get_user(client, login: broadcaster_login),
+         broadcaster_id = broadcaster["id"],
+         {:ok, videos} <- fetch_week_videos(client, broadcaster_id),
+         {:ok, top_clips} <- fetch_week_top_clips(client, broadcaster_id) do
+      {:ok, format_report(broadcaster["display_name"], videos, top_clips)}
+    end
+  end
+
+  defp fetch_week_videos(client, broadcaster_id) do
+    case Twitchy.Videos.get_videos(client,
+           user_id: broadcaster_id,
+           type: :archive,
+           period: :week,
+           sort: :time,
+           first: 20
+         ) do
+      {:ok, %{"data" => videos}} -> {:ok, videos}
+      error -> error
+    end
+  end
+
+  defp fetch_week_top_clips(client, broadcaster_id) do
+    started_at = DateTime.utc_now() |> DateTime.add(-7, :day) |> DateTime.to_iso8601()
+    ended_at = DateTime.utc_now() |> DateTime.to_iso8601()
+
+    case Twitchy.Clips.get_clips(client,
+           broadcaster_id: broadcaster_id,
+           started_at: started_at,
+           ended_at: ended_at,
+           first: 100
+         ) do
+      {:ok, %{"data" => clips}} ->
+        top_clips =
+          clips
+          |> Enum.sort_by(& &1["view_count"], :desc)
+          |> Enum.take(@top_clip_count)
+
+        {:ok, top_clips}
+
+      error ->
+        error
+    end
+  end
+
+  defp format_report(display_name, videos, clips) do
+    """
+    **#{display_name}'s Weekly Highlights**
+
+    **VODs this week (#{length(videos)})**
+    #{format_list(videos, &"- #{&1["title"]} (#{&1["view_count"]} views) — #{&1["url"]}")}
+
+    **Top clips this week**
+    #{format_list(clips, &"- #{&1["title"]} by #{&1["creator_name"]} (#{&1["view_count"]} views) — #{&1["url"]}")}
+    """
+  end
+
+  defp format_list([], _formatter), do: "_Nothing this week._"
+  defp format_list(items, formatter), do: Enum.map_join(items, "\n", formatter)
+
+  @doc """
+  Bonus: creates a clip of the broadcaster's current stream.
+
+  Requires a user access token with the `clips:edit` scope, and the
+  broadcaster's channel must be live — `create_clip/2` fails otherwise.
+  Twitch also needs a moment to process the clip, so this polls
+  `get_clip/2` a few times with a short delay rather than fetching it
+  immediately.
+  """
+  @spec create_live_clip(Twitchy.t(), String.t()) :: {:ok, map()} | {:error, term()}
+  def create_live_clip(user_client, broadcaster_id) do
+    with {:ok, %{"data" => [%{"id" => clip_id, "edit_url" => edit_url} | _]}} <-
+           Twitchy.Clips.create_clip(user_client, broadcaster_id: broadcaster_id) do
+      IO.puts("Clip requested (##{clip_id}). Finish editing at: #{edit_url}")
+      wait_for_clip(user_client, clip_id)
+    end
+  end
+
+  defp wait_for_clip(client, clip_id, attempts \\ 5)
+
+  defp wait_for_clip(_client, clip_id, 0), do: {:error, {:clip_not_ready, clip_id}}
+
+  defp wait_for_clip(client, clip_id, attempts) do
+    case Twitchy.Clips.get_clip(client, id: clip_id) do
+      {:ok, nil} ->
+        Process.sleep(3_000)
+        wait_for_clip(client, clip_id, attempts - 1)
+
+      {:ok, clip} ->
+        {:ok, clip}
+
+      error ->
+        error
+    end
+  end
+end
+```
+
+Usage — the digest only needs an app access token:
+
+```elixir
+{:ok, client} = Twitchy.authenticate(client, :app_access)
+
+{:ok, report} = MyApp.WeeklyDigest.build(client, "your_channel_name")
+IO.puts(report)
+```
+
+The bonus step needs a user access token for the broadcaster (see
+[TUTORIAL.md](../../TUTORIAL.md) for how to obtain one) and only does
+anything useful while the channel is actually streaming:
+
+```elixir
+{:ok, user_client} = Twitchy.authenticate(client, :user_access, code: code)
+
+{:ok, clip} = MyApp.WeeklyDigest.create_live_clip(user_client, broadcaster_id)
+IO.puts("Clip ready: #{clip["url"]}")
 ```
 
 ## Best Practices

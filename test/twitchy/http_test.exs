@@ -2,7 +2,7 @@ defmodule Twitchy.HTTPTest do
   use ExUnit.Case, async: true
 
   alias Twitchy.HTTP
-  import Twitchy.{TestHelpers, BypassHelpers}
+  import Twitchy.TestHelpers
 
   setup do
     bypass = Bypass.open()

@@ -105,7 +105,8 @@ Snooze upcoming automatic mid-roll ads (requires `channel:manage:ads` scope).
 
 ```elixir
 {:ok, response} = Twitchy.Ads.snooze_next_ad(client,
-  broadcaster_id: "123456"
+  broadcaster_id: "123456",
+  duration: 60  # 60-180 seconds
 )
 
 snooze = List.first(response["data"])
@@ -188,7 +189,7 @@ end)
 Send a whisper/direct message to another user (requires `user:manage:whispers` scope).
 
 ```elixir
-{:ok, response} = Twitchy.Whispers.send_whisper(client,
+:ok = Twitchy.Whispers.send_whisper(client,
   from_user_id: "123456",
   to_user_id: "789",
   message: "Hey! Thanks for the follow!"
@@ -619,6 +620,250 @@ defmodule MyApp.CharityTracker do
     Process.send_after(self(), :update_progress, 300_000)
   end
 end
+```
+
+## Tutorial
+
+### Build a Channel Insights Reporter
+
+This tutorial builds a small script that gives a broadcaster a quick pulse
+check on their channel without opening the Twitch dashboard: it looks up the
+category they're streaming under, checks progress on their creator goal,
+checks the running total of their active charity campaign, and whispers a
+one-line summary to the broadcaster. It touches four of the APIs on this
+page — Search, Goals, Charity, and Whispers — and shows a realistic multi-token
+setup, since reading a broadcaster's private data and whispering *to* that
+broadcaster require two different user access tokens.
+
+A note on scope: `Twitchy.Analytics.get_game_analytics/2` needs the
+`analytics:read:games` scope, which only applies to accounts with an
+affiliated Twitch Extension — not something a typical broadcaster-facing
+script can assume. `Twitchy.Goals.get_creator_goals/2` needs only
+`channel:read:goals`, which any broadcaster can grant, so this tutorial
+checks goal progress instead of game analytics.
+
+#### Two tokens, one script
+
+The reporter needs data the *broadcaster* authorizes (`channel:read:goals`,
+`channel:read:charity`) and it needs to whisper *to* that broadcaster, which
+requires a token belonging to someone else — a separate "reporter bot"
+account can't whisper itself. So the script holds two `Twitchy` clients:
+
+- `broadcaster_client` — a user access token the broadcaster authorized with
+  `channel:read:goals` and `channel:read:charity`.
+- `bot_client` — a user access token for a dedicated reporter-bot account,
+  authorized with `user:manage:whispers`.
+
+Both are built the same way, just with different tokens — `Twitchy.new/1`
+accepts a pre-existing `:access_token` directly, which is handy when you've
+already run the OAuth flow (see [TUTORIAL.md](../../TUTORIAL.md)) and are
+loading a saved token rather than exchanging a fresh code:
+
+```elixir
+broadcaster_client =
+  Twitchy.new(
+    client_id: client_id,
+    client_secret: client_secret,
+    access_token: broadcaster_token,
+    token_type: :user_access
+  )
+
+bot_client =
+  Twitchy.new(
+    client_id: client_id,
+    client_secret: client_secret,
+    access_token: bot_token,
+    token_type: :user_access
+  )
+```
+
+(See [USAGE_GUIDE.md](../../USAGE_GUIDE.md) for token storage patterns —
+in practice you'd load `broadcaster_token` and `bot_token` from wherever
+your app persists refresh tokens per user.)
+
+### Step 1: Look Up the Category
+
+`Twitchy.Search.search_categories/2` doesn't require any scope, so it works
+with either client. We use it to confirm the category exists and grab its
+display name for the summary message:
+
+```elixir
+{:ok, %{"data" => categories}} =
+  Twitchy.Search.search_categories(broadcaster_client, query: "Software and Game Development", first: 1)
+
+category_name =
+  case categories do
+    [category | _] -> category["name"]
+    [] -> "an unlisted category"
+  end
+```
+
+### Step 2: Check Creator Goal Progress
+
+`Twitchy.Goals.get_creator_goals/2` returns every active goal for the
+broadcaster. A channel can run more than one goal at a time, so we report on
+the first one:
+
+```elixir
+{:ok, %{"data" => goals}} =
+  Twitchy.Goals.get_creator_goals(broadcaster_client, broadcaster_id: broadcaster_id)
+
+goal_summary =
+  case goals do
+    [goal | _] ->
+      pct = (goal["current_amount"] / goal["target_amount"] * 100) |> round()
+      "#{goal["description"]}: #{goal["current_amount"]}/#{goal["target_amount"]} (#{pct}%)"
+
+    [] ->
+      "no active goal"
+  end
+```
+
+### Step 3: Check the Charity Campaign Total
+
+`Twitchy.Charity.get_charity_campaign/2` returns at most one running
+campaign — `response["data"]` is `[]` if none is active, so that has to be
+handled explicitly:
+
+```elixir
+{:ok, %{"data" => campaigns}} =
+  Twitchy.Charity.get_charity_campaign(broadcaster_client, broadcaster_id: broadcaster_id)
+
+charity_summary =
+  case campaigns do
+    [campaign | _] ->
+      current = campaign["current_amount"]["value"]
+      target = campaign["target_amount"]["value"]
+      "#{campaign["charity_name"]}: $#{current}/$#{target}"
+
+    [] ->
+      "no active charity campaign"
+  end
+```
+
+### Step 4: Compose and Send the Summary
+
+`Twitchy.Whispers.send_whisper/2` caps messages at 500 characters and
+returns `:ok` on success (not `{:ok, _}`), since the whisper endpoint has no
+response body worth returning. We build the message from the three pieces
+gathered above, truncate defensively, and send it from the bot account to
+the broadcaster:
+
+```elixir
+message =
+  "📊 Channel Insights — Category: #{category_name} | Goal: #{goal_summary} | Charity: #{charity_summary}"
+  |> String.slice(0, 500)
+
+:ok =
+  Twitchy.Whispers.send_whisper(bot_client,
+    from_user_id: bot_user_id,
+    to_user_id: broadcaster_id,
+    message: message
+  )
+```
+
+Twitch requires the recipient to allow whispers from the sender (following
+the bot, or having chatted with it recently) — a `{:error, _}` here most
+often means that relationship doesn't exist yet, not that something is
+broken.
+
+### The Complete Example
+
+Everything above assembled into one module. It takes both clients and the
+two account IDs as arguments so it can be called from a scheduled job (e.g. a
+`GenServer` timer, an Oban job, or a one-off `mix run` script) without
+holding any process state of its own:
+
+```elixir
+defmodule MyApp.InsightsReporter do
+  @moduledoc """
+  Builds a one-line channel insights summary (category, goal progress,
+  charity total) and whispers it to the broadcaster.
+  """
+
+  require Logger
+
+  @doc """
+  Runs one report cycle: looks up `category_query`, checks the broadcaster's
+  goal and charity progress, and whispers the summary from the bot account
+  to the broadcaster.
+
+  `broadcaster_client` must hold a token authorized with `channel:read:goals`
+  and `channel:read:charity`. `bot_client` must hold a token authorized with
+  `user:manage:whispers`.
+  """
+  @spec run(Twitchy.t(), Twitchy.t(), String.t(), String.t(), String.t()) ::
+          :ok | {:error, Exception.t()}
+  def run(broadcaster_client, bot_client, broadcaster_id, bot_user_id, category_query) do
+    with {:ok, category_name} <- fetch_category_name(broadcaster_client, category_query),
+         {:ok, goal_summary} <- fetch_goal_summary(broadcaster_client, broadcaster_id),
+         {:ok, charity_summary} <- fetch_charity_summary(broadcaster_client, broadcaster_id) do
+      message =
+        "📊 Channel Insights — Category: #{category_name} | Goal: #{goal_summary} | Charity: #{charity_summary}"
+        |> String.slice(0, 500)
+
+      case Twitchy.Whispers.send_whisper(bot_client,
+             from_user_id: bot_user_id,
+             to_user_id: broadcaster_id,
+             message: message
+           ) do
+        :ok ->
+          Logger.info("Sent insights whisper to #{broadcaster_id}")
+          :ok
+
+        {:error, error} ->
+          Logger.warning("Failed to whisper insights: #{Exception.message(error)}")
+          {:error, error}
+      end
+    end
+  end
+
+  defp fetch_category_name(client, query) do
+    case Twitchy.Search.search_categories(client, query: query, first: 1) do
+      {:ok, %{"data" => [category | _]}} -> {:ok, category["name"]}
+      {:ok, %{"data" => []}} -> {:ok, "an unlisted category"}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp fetch_goal_summary(client, broadcaster_id) do
+    case Twitchy.Goals.get_creator_goals(client, broadcaster_id: broadcaster_id) do
+      {:ok, %{"data" => [goal | _]}} ->
+        pct = (goal["current_amount"] / goal["target_amount"] * 100) |> round()
+        {:ok, "#{goal["description"]}: #{goal["current_amount"]}/#{goal["target_amount"]} (#{pct}%)"}
+
+      {:ok, %{"data" => []}} ->
+        {:ok, "no active goal"}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  defp fetch_charity_summary(client, broadcaster_id) do
+    case Twitchy.Charity.get_charity_campaign(client, broadcaster_id: broadcaster_id) do
+      {:ok, %{"data" => [campaign | _]}} ->
+        current = campaign["current_amount"]["value"]
+        target = campaign["target_amount"]["value"]
+        {:ok, "#{campaign["charity_name"]}: $#{current}/$#{target}"}
+
+      {:ok, %{"data" => []}} ->
+        {:ok, "no active charity campaign"}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+end
+
+# Usage — run once, or wire into a scheduler:
+MyApp.InsightsReporter.run(
+  broadcaster_client,
+  bot_client,
+  broadcaster_id,
+  bot_user_id,
+  "Software and Game Development"
+)
 ```
 
 ## Best Practices

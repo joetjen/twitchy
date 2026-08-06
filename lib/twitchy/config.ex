@@ -23,6 +23,7 @@ defmodule Twitchy.Config do
 
           # HTTP configuration
           base_url: String.t(),
+          auth_base_url: String.t(),
           timeout: timeout(),
           retry_attempts: non_neg_integer(),
           finch_pool: atom(),
@@ -49,6 +50,7 @@ defmodule Twitchy.Config do
             expires_at: nil,
             scopes: [],
             base_url: "https://api.twitch.tv/helix",
+            auth_base_url: "https://id.twitch.tv/oauth2",
             timeout: 30_000,
             retry_attempts: 3,
             finch_pool: Twitchy.Finch,
@@ -113,24 +115,21 @@ defmodule Twitchy.Config do
   """
   @spec validate(t(), :app_auth | :user_auth | :api_call) :: :ok | {:error, String.t()}
   def validate(%__MODULE__{} = config, :app_auth) do
-    with :ok <- require_field(config, :client_id, "app authentication"),
-         :ok <- require_field(config, :client_secret, "app authentication") do
-      :ok
+    with :ok <- require_field(config, :client_id, "app authentication") do
+      require_field(config, :client_secret, "app authentication")
     end
   end
 
   def validate(%__MODULE__{} = config, :user_auth) do
     with :ok <- require_field(config, :client_id, "user authentication"),
-         :ok <- require_field(config, :client_secret, "user authentication"),
-         :ok <- require_field(config, :redirect_uri, "user authentication") do
-      :ok
+         :ok <- require_field(config, :client_secret, "user authentication") do
+      require_field(config, :redirect_uri, "user authentication")
     end
   end
 
   def validate(%__MODULE__{} = config, :api_call) do
-    with :ok <- require_field(config, :client_id, "API calls"),
-         :ok <- require_field(config, :access_token, "API calls") do
-      :ok
+    with :ok <- require_field(config, :client_id, "API calls") do
+      require_field(config, :access_token, "API calls")
     end
   end
 

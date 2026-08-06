@@ -502,7 +502,7 @@ end
 
 - [Quick Start Guide](QUICKSTART.md)
 - [Usage Guide](USAGE_GUIDE.md)
-- [API Documentation](docs/api/)
+- [API Documentation](docs/api/API_REFERENCE.md)
   - [Users & Streams](docs/api/USERS_STREAMS.md)
   - [Channels & Games](docs/api/CHANNELS_GAMES.md)
   - [Videos & Clips](docs/api/VIDEOS_CLIPS.md)

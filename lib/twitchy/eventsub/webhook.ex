@@ -178,20 +178,24 @@ defmodule Twitchy.EventSub.Webhook do
     if opts[:skip_timestamp_check] do
       :ok
     else
-      case DateTime.from_iso8601(timestamp) do
-        {:ok, message_time, _offset} ->
-          now = DateTime.utc_now()
-          age_seconds = DateTime.diff(now, message_time)
+      check_timestamp_age(timestamp)
+    end
+  end
 
-          if age_seconds <= @max_message_age_seconds do
-            :ok
-          else
-            {:error, :timestamp_too_old}
-          end
+  defp check_timestamp_age(timestamp) do
+    case DateTime.from_iso8601(timestamp) do
+      {:ok, message_time, _offset} -> check_age(message_time)
+      {:error, _} -> {:error, :invalid_timestamp}
+    end
+  end
 
-        {:error, _} ->
-          {:error, :invalid_timestamp}
-      end
+  defp check_age(message_time) do
+    age_seconds = DateTime.diff(DateTime.utc_now(), message_time)
+
+    if age_seconds <= @max_message_age_seconds do
+      :ok
+    else
+      {:error, :timestamp_too_old}
     end
   end
 
@@ -259,14 +263,16 @@ defmodule Twitchy.EventSub.Webhook do
         :ok
 
       agent when is_pid(agent) or is_atom(agent) ->
-        message_id = headers.message_id
+        check_and_record_message_id(agent, headers.message_id)
+    end
+  end
 
-        if Agent.get(agent, fn ids -> MapSet.member?(ids, message_id) end) do
-          {:error, :duplicate_message_id}
-        else
-          Agent.update(agent, fn ids -> MapSet.put(ids, message_id) end)
-          :ok
-        end
+  defp check_and_record_message_id(agent, message_id) do
+    if Agent.get(agent, &MapSet.member?(&1, message_id)) do
+      {:error, :duplicate_message_id}
+    else
+      Agent.update(agent, &MapSet.put(&1, message_id))
+      :ok
     end
   end
 

@@ -53,19 +53,17 @@ Modify chat settings (requires `moderator:manage:chat_settings` scope).
 )
 ```
 
-### Send Chat Message
+### Send Chat Announcement
 
-Send a message to chat (requires `user:write:chat` scope).
+Post an announcement to chat (requires `moderator:manage:announcements` scope).
 
 ```elixir
-{:ok, response} = Twitchy.Chat.send_chat_message(client,
+:ok = Twitchy.Chat.send_chat_announcement(client,
   broadcaster_id: "123456",
-  sender_id: "123456",
-  message: "Hello chat! PogChamp"
+  moderator_id: "123456",
+  message: "Hello chat! PogChamp",
+  color: :primary
 )
-
-sent_message = List.first(response["data"])
-IO.puts("Message sent! ID: #{sent_message["message_id"]}")
 ```
 
 ### Get Emotes
@@ -112,7 +110,7 @@ Ban or timeout a user (requires `moderator:manage:banned_users` scope).
 
 ```elixir
 # Permanent ban
-{:ok, response} = Twitchy.Moderation.ban_user(client,
+:ok = Twitchy.Moderation.ban_user(client,
   broadcaster_id: "123456",
   moderator_id: "123456",
   user_id: "789",
@@ -120,7 +118,7 @@ Ban or timeout a user (requires `moderator:manage:banned_users` scope).
 )
 
 # Temporary timeout (600 seconds = 10 minutes)
-{:ok, response} = Twitchy.Moderation.ban_user(client,
+:ok = Twitchy.Moderation.ban_user(client,
   broadcaster_id: "123456",
   moderator_id: "123456",
   user_id: "789",
@@ -134,7 +132,7 @@ Ban or timeout a user (requires `moderator:manage:banned_users` scope).
 Remove a ban or timeout.
 
 ```elixir
-{:ok, response} = Twitchy.Moderation.unban_user(client,
+:ok = Twitchy.Moderation.unban_user(client,
   broadcaster_id: "123456",
   moderator_id: "123456",
   user_id: "789"
@@ -184,41 +182,15 @@ Manage channel moderators (requires `channel:manage:moderators` scope).
 
 ```elixir
 # Add moderator
-{:ok, _} = Twitchy.Moderation.add_channel_moderator(client,
+:ok = Twitchy.Moderation.add_channel_moderator(client,
   broadcaster_id: "123456",
   user_id: "789"
 )
 
 # Remove moderator
-{:ok, _} = Twitchy.Moderation.remove_channel_moderator(client,
+:ok = Twitchy.Moderation.remove_channel_moderator(client,
   broadcaster_id: "123456",
   user_id: "789"
-)
-```
-
-### Block/Unblock Terms
-
-Manage blocked terms (AutoMod).
-
-```elixir
-# Add blocked terms
-{:ok, response} = Twitchy.Moderation.add_blocked_term(client,
-  broadcaster_id: "123456",
-  moderator_id: "123456",
-  text: "badword"
-)
-
-# Get blocked terms
-{:ok, response} = Twitchy.Moderation.get_blocked_terms(client,
-  broadcaster_id: "123456",
-  moderator_id: "123456"
-)
-
-# Remove blocked term
-{:ok, _} = Twitchy.Moderation.remove_blocked_term(client,
-  broadcaster_id: "123456",
-  moderator_id: "123456",
-  id: "term_id_here"
 )
 ```
 
@@ -248,26 +220,6 @@ IO.puts("Sexuality: #{settings["sexuality_sex_or_gender"]}")
 )
 ```
 
-### Manage Held AutoMod Messages
-
-Handle messages held by AutoMod.
-
-```elixir
-# Approve message
-{:ok, _} = Twitchy.Moderation.manage_held_automod_messages(client,
-  user_id: "123456",
-  msg_id: "message_id_here",
-  action: "ALLOW"
-)
-
-# Deny message
-{:ok, _} = Twitchy.Moderation.manage_held_automod_messages(client,
-  user_id: "123456",
-  msg_id: "message_id_here",
-  action: "DENY"
-)
-```
-
 ## Examples
 
 ### Chat Bot
@@ -289,14 +241,16 @@ defmodule MyApp.ChatBot do
 
     # Subscribe to chat events via EventSub
     {:ok, _} = Twitchy.EventSub.Declarative.start_link(
+      name: :chat_bot_eventsub,
       client: client,
-      handler: __MODULE__,
+      handler: {__MODULE__, :handle_event, []},
       subscriptions: [
         %{
           type: "channel.chat.message",
+          version: "1",
           condition: %{
-            "broadcaster_user_id" => channel_id,
-            "user_id" => channel_id
+            broadcaster_user_id: channel_id,
+            user_id: channel_id
           }
         }
       ]
@@ -309,8 +263,19 @@ defmodule MyApp.ChatBot do
     }}
   end
 
-  # Handle chat messages
-  def handle_event("channel.chat.message", event, _meta) do
+  # The handler is called for every WebSocket message, not just notifications —
+  # filter for the message type and subscription type we care about.
+  def handle_event(%{"metadata" => %{"message_type" => "notification"}} = event, _opts) do
+    if get_in(event, ["payload", "subscription", "type"]) == "channel.chat.message" do
+      handle_chat_message(get_in(event, ["payload", "event"]))
+    end
+
+    :ok
+  end
+
+  def handle_event(_event, _opts), do: :ok
+
+  defp handle_chat_message(event) do
     message = event["message"]["text"]
     user = event["chatter_user_name"]
     user_id = event["chatter_user_id"]
@@ -360,9 +325,9 @@ defmodule MyApp.ChatBot do
   defp send_message(text) do
     state = :sys.get_state(__MODULE__)
 
-    Twitchy.Chat.send_chat_message(state.client,
+    Twitchy.Chat.send_chat_announcement(state.client,
       broadcaster_id: state.channel_id,
-      sender_id: state.channel_id,
+      moderator_id: state.channel_id,
       message: text
     )
   end
@@ -391,6 +356,7 @@ Automated moderation with customizable rules.
 ```elixir
 defmodule MyApp.ModerationBot do
   use GenServer
+  require Logger
 
   @spam_threshold 5  # Messages per 10 seconds
   @caps_threshold 0.7  # 70% caps = warning
@@ -403,22 +369,21 @@ defmodule MyApp.ModerationBot do
     client = opts[:client]
     channel_id = opts[:channel_id]
 
+    # Note: Twitchy doesn't currently expose an endpoint for resolving already-held
+    # AutoMod messages, so this bot only reacts to messages after they're posted
+    # (via `channel.chat.message`). Use `Twitchy.Moderation.check_automod_status/2`
+    # if you need to pre-screen messages before they reach chat.
     {:ok, _} = Twitchy.EventSub.Declarative.start_link(
+      name: :moderation_bot_eventsub,
       client: client,
-      handler: __MODULE__,
+      handler: {__MODULE__, :handle_event, []},
       subscriptions: [
         %{
           type: "channel.chat.message",
+          version: "1",
           condition: %{
-            "broadcaster_user_id" => channel_id,
-            "user_id" => channel_id
-          }
-        },
-        %{
-          type: "automod.message.hold",
-          condition: %{
-            "broadcaster_user_id" => channel_id,
-            "moderator_user_id" => channel_id
+            broadcaster_user_id: channel_id,
+            user_id: channel_id
           }
         }
       ]
@@ -432,7 +397,19 @@ defmodule MyApp.ModerationBot do
     }}
   end
 
-  def handle_event("channel.chat.message", event, _meta) do
+  # The handler is called for every WebSocket message, not just notifications —
+  # filter for the message type and subscription type we care about.
+  def handle_event(%{"metadata" => %{"message_type" => "notification"}} = event, _opts) do
+    if get_in(event, ["payload", "subscription", "type"]) == "channel.chat.message" do
+      handle_chat_message(get_in(event, ["payload", "event"]))
+    end
+
+    :ok
+  end
+
+  def handle_event(_event, _opts), do: :ok
+
+  defp handle_chat_message(event) do
     message = event["message"]["text"]
     user_id = event["chatter_user_id"]
     user_name = event["chatter_user_name"]
@@ -442,7 +419,7 @@ defmodule MyApp.ModerationBot do
     # Check for spam
     if is_spam?(state, user_id) do
       timeout_user(state.client, state.channel_id, user_id, 300, "Spam")
-      Logger.warn("Timed out #{user_name} for spam")
+      Logger.warning("Timed out #{user_name} for spam")
     end
 
     # Check for excessive caps
@@ -457,28 +434,6 @@ defmodule MyApp.ModerationBot do
 
     # Track message for spam detection
     GenServer.cast(__MODULE__, {:track_message, user_id})
-
-    :ok
-  end
-
-  def handle_event("automod.message.hold", event, _meta) do
-    message_id = event["message_id"]
-    user_id = event["user_id"]
-
-    state = :sys.get_state(__MODULE__)
-
-    # Auto-deny if user has been warned
-    action = if MapSet.member?(state.warned_users, user_id) do
-      "DENY"
-    else
-      "ALLOW"
-    end
-
-    Twitchy.Moderation.manage_held_automod_messages(state.client,
-      user_id: state.channel_id,
-      msg_id: message_id,
-      action: action
-    )
 
     :ok
   end
@@ -518,20 +473,23 @@ defmodule MyApp.ModerationBot do
   end
 
   defp excessive_caps?(message) do
-    return false if String.length(message) < 10
+    if String.length(message) < 10 do
+      false
+    else
+      caps_count = message
+        |> String.graphemes()
+        |> Enum.count(&(&1 =~ ~r/[A-Z]/))
 
-    caps_count = message
-      |> String.graphemes()
-      |> Enum.count(&(&1 =~ ~r/[A-Z]/))
+      total_letters = message
+        |> String.graphemes()
+        |> Enum.count(&(&1 =~ ~r/[A-Za-z]/))
 
-    total_letters = message
-      |> String.graphemes()
-      |> Enum.count(&(&1 =~ ~r/[A-Za-z]/))
-
-    return false if total_letters == 0
-
-    caps_ratio = caps_count / total_letters
-    caps_ratio >= @caps_threshold
+      if total_letters == 0 do
+        false
+      else
+        caps_count / total_letters >= @caps_threshold
+      end
+    end
   end
 
   defp is_moderator?(_user_id) do
@@ -551,9 +509,9 @@ defmodule MyApp.ModerationBot do
   end
 
   defp warn_user(client, broadcaster_id, user_name, warning) do
-    Twitchy.Chat.send_chat_message(client,
+    Twitchy.Chat.send_chat_announcement(client,
       broadcaster_id: broadcaster_id,
-      sender_id: broadcaster_id,
+      moderator_id: broadcaster_id,
       message: "@#{user_name} #{warning}"
     )
   end
@@ -643,6 +601,282 @@ defmodule MyApp.ChatAnalytics do
   end
 end
 ```
+
+## Tutorial
+
+This tutorial builds a small **Chat Moderation Assistant**: a toolkit of plain
+functions that a mod team can call from `iex`, a scheduled job, or a chat
+command handler. It screens a batch of reported messages through AutoMod
+before anyone acts on them, bans or times out a user once a violation is
+confirmed, promotes a trusted community member to moderator, and — as a
+bonus for raid nights — flips on Shield Mode. Each step uses one real,
+documented `Twitchy.Moderation` function; the complete assistant at the end
+ties them together into a module you can drop straight into a project.
+
+### Step 1: Set Up the Client
+
+Everything here runs with a broadcaster's user access token. A broadcaster's
+own token can always moderate their own channel, so — as in the other
+tutorials in this guide — we use the same ID for both `broadcaster_id` and
+`moderator_id`:
+
+```elixir
+client =
+  Twitchy.new(
+    client_id: System.fetch_env!("TWITCH_CLIENT_ID"),
+    client_secret: System.fetch_env!("TWITCH_CLIENT_SECRET"),
+    refresh_token: System.fetch_env!("TWITCH_MOD_REFRESH_TOKEN")
+  )
+
+{:ok, client} = Twitchy.refresh_token(client)
+
+broadcaster_id = "123456"
+moderator_id = broadcaster_id
+```
+
+The token needs `moderation:read`, `moderator:manage:banned_users`,
+`channel:manage:moderators`, and `moderator:manage:shield_mode` scopes for
+the four steps below — see [Scopes Used](#scopes-used) at the end for exactly
+which step needs which.
+
+### Step 2: Screen Reported Messages with AutoMod
+
+Before banning anyone, run their reported messages past AutoMod so the
+decision is based on Twitch's own judgment of the content, not just a mod's
+gut feeling. `Twitchy.Moderation.check_automod_status/2` takes a list of
+`%{msg_id:, msg_text:, user_id:}` maps and checks all of them in one request:
+
+```elixir
+{:ok, response} =
+  Twitchy.Moderation.check_automod_status(client,
+    broadcaster_id: broadcaster_id,
+    messages: [
+      %{msg_id: "1001", msg_text: "check out my totally legit crypto giveaway", user_id: "555"},
+      %{msg_id: "1002", msg_text: "gg well played everyone", user_id: "556"}
+    ]
+  )
+
+flagged_msg_ids =
+  response["data"]
+  |> Enum.reject(& &1["is_permitted"])
+  |> Enum.map(& &1["msg_id"])
+
+IO.inspect(flagged_msg_ids, label: "Messages AutoMod would hold")
+```
+
+`check_automod_status/2` only requires the `moderation:read` scope — it's a
+read-only check, so it's safe to run speculatively on anything a viewer
+reports without taking any action yet.
+
+### Step 3: Ban or Time Out a Confirmed Violator
+
+Once a message is confirmed as a violation (by the AutoMod check above, a
+mod's own judgment, or both), `Twitchy.Moderation.ban_user/2` handles both
+permanent bans and timeouts — the only difference is whether you pass a
+`:duration`:
+
+```elixir
+# A clear, repeat violation: permanent ban.
+:ok =
+  Twitchy.Moderation.ban_user(client,
+    broadcaster_id: broadcaster_id,
+    moderator_id: moderator_id,
+    user_id: "555",
+    reason: "Crypto scam link, repeat offense"
+  )
+
+# A first-time, lower-severity violation: 10-minute timeout instead.
+:ok =
+  Twitchy.Moderation.ban_user(client,
+    broadcaster_id: broadcaster_id,
+    moderator_id: moderator_id,
+    user_id: "556",
+    duration: 600,
+    reason: "Excessive caps"
+  )
+```
+
+Omitting `:duration` bans the user permanently; including it (1–1,209,600
+seconds) turns the same call into a timeout instead. This needs the
+`moderator:manage:banned_users` scope.
+
+### Step 4: Keep the Moderator List in Sync
+
+Moderation isn't only about removing bad actors — it's also about
+deputizing trusted ones. `Twitchy.Moderation.add_channel_moderator/2` adds a
+community member to the channel's moderator list:
+
+```elixir
+:ok =
+  Twitchy.Moderation.add_channel_moderator(client,
+    broadcaster_id: broadcaster_id,
+    user_id: "777"
+  )
+```
+
+This requires the `channel:manage:moderators` scope, and it's worth pairing
+with `Twitchy.Moderation.get_moderators/2` beforehand if you're syncing
+against an external list of "trusted" users, so you don't re-add someone
+who's already a mod.
+
+### Step 5 (Bonus): Enable Shield Mode During a Raid
+
+When a hate raid or a wave of ban-evading accounts hits the channel all at
+once, individually banning each one doesn't scale. `Twitchy.Moderation.update_shield_mode_status/2`
+turns on the broadcaster's pre-configured Shield Mode protections in a
+single call:
+
+```elixir
+{:ok, response} =
+  Twitchy.Moderation.update_shield_mode_status(client,
+    broadcaster_id: broadcaster_id,
+    moderator_id: moderator_id,
+    is_active: true
+  )
+
+IO.puts("Shield Mode active: #{response["data"] |> List.first() |> Map.get("is_active")}")
+```
+
+Unlike `ban_user/2` and `add_channel_moderator/2`, this call returns
+`{:ok, map()}` with the updated status rather than a bare `:ok` — useful for
+confirming the toggle actually took effect. Turning it back off afterward is
+the same call with `is_active: false`. This requires the
+`moderator:manage:shield_mode` scope.
+
+### The Complete Example
+
+Putting all four pieces together as a small toolkit module. Each public
+function wraps exactly one `Twitchy.Moderation` call plus the bit of logic
+that makes it useful on its own — no supervision tree required, just call
+these from `iex`, a scheduled job, or a chat command handler:
+
+```elixir
+defmodule MyApp.ModerationAssistant do
+  @moduledoc """
+  A small toolkit for reviewing reported messages, acting on confirmed
+  violations, syncing the moderator list, and toggling Shield Mode during
+  raids.
+  """
+
+  require Logger
+
+  @doc """
+  Runs a batch of reported messages through AutoMod and returns the
+  `msg_id`s AutoMod would hold, so a human mod can decide what to do next.
+  """
+  def screen_messages(client, broadcaster_id, messages) do
+    case Twitchy.Moderation.check_automod_status(client,
+           broadcaster_id: broadcaster_id,
+           messages: messages
+         ) do
+      {:ok, %{"data" => results}} ->
+        flagged = results |> Enum.reject(& &1["is_permitted"]) |> Enum.map(& &1["msg_id"])
+        {:ok, flagged}
+
+      {:error, error} ->
+        Logger.error("AutoMod check failed: #{Exception.message(error)}")
+        {:error, error}
+    end
+  end
+
+  @doc """
+  Bans a user permanently, or times them out when `duration` (in seconds)
+  is given.
+  """
+  def take_action(client, broadcaster_id, moderator_id, user_id, reason, duration \\ nil) do
+    params =
+      [broadcaster_id: broadcaster_id, moderator_id: moderator_id, user_id: user_id, reason: reason]
+      |> maybe_put_duration(duration)
+
+    case Twitchy.Moderation.ban_user(client, params) do
+      :ok ->
+        Logger.info("Actioned #{user_id}#{if duration, do: " (#{duration}s timeout)", else: " (ban)"}")
+        :ok
+
+      {:error, error} ->
+        Logger.error("Failed to action #{user_id}: #{Exception.message(error)}")
+        {:error, error}
+    end
+  end
+
+  defp maybe_put_duration(params, nil), do: params
+  defp maybe_put_duration(params, duration), do: Keyword.put(params, :duration, duration)
+
+  @doc """
+  Promotes a trusted community member to moderator, skipping anyone who's
+  already on the moderator list.
+  """
+  def promote_to_moderator(client, broadcaster_id, user_id) do
+    with {:ok, %{"data" => mods}} <-
+           Twitchy.Moderation.get_moderators(client, broadcaster_id: broadcaster_id) do
+      if Enum.any?(mods, &(&1["user_id"] == user_id)) do
+        Logger.info("#{user_id} is already a moderator")
+        :ok
+      else
+        Twitchy.Moderation.add_channel_moderator(client,
+          broadcaster_id: broadcaster_id,
+          user_id: user_id
+        )
+      end
+    end
+  end
+
+  @doc """
+  Turns Shield Mode on or off and returns whether it's now active.
+  """
+  def set_shield_mode(client, broadcaster_id, moderator_id, active?) do
+    case Twitchy.Moderation.update_shield_mode_status(client,
+           broadcaster_id: broadcaster_id,
+           moderator_id: moderator_id,
+           is_active: active?
+         ) do
+      {:ok, %{"data" => [status | _]}} ->
+        Logger.info("Shield Mode is now #{status["is_active"]}")
+        {:ok, status["is_active"]}
+
+      {:error, error} ->
+        Logger.error("Failed to update Shield Mode: #{Exception.message(error)}")
+        {:error, error}
+    end
+  end
+end
+```
+
+Using it during a raid, from `iex -S mix`:
+
+```elixir
+alias MyApp.ModerationAssistant, as: Mod
+
+broadcaster_id = "123456"
+moderator_id = broadcaster_id
+
+# 1. Screen a batch of reported messages.
+{:ok, flagged} =
+  Mod.screen_messages(client, broadcaster_id, [
+    %{msg_id: "1001", msg_text: "check out my totally legit crypto giveaway", user_id: "555"}
+  ])
+
+# 2. Ban the clear violator AutoMod flagged.
+:ok = Mod.take_action(client, broadcaster_id, moderator_id, "555", "Crypto scam link")
+
+# 3. Deputize a trusted community member.
+:ok = Mod.promote_to_moderator(client, broadcaster_id, "777")
+
+# 4. A hate raid starts — lock the channel down.
+{:ok, true} = Mod.set_shield_mode(client, broadcaster_id, moderator_id, true)
+
+# ...later, once it's over...
+{:ok, false} = Mod.set_shield_mode(client, broadcaster_id, moderator_id, false)
+```
+
+### Scopes Used
+
+| Step | Function | Required Scope |
+| ---- | -------- | --------------- |
+| Screen messages | `check_automod_status/2` | `moderation:read` |
+| Ban / time out | `ban_user/2` | `moderator:manage:banned_users` |
+| Sync moderator list | `get_moderators/2`, `add_channel_moderator/2` | `moderation:read` or `channel:manage:moderators`; `channel:manage:moderators` |
+| Shield Mode | `update_shield_mode_status/2` | `moderator:manage:shield_mode` |
 
 ## Best Practices
 

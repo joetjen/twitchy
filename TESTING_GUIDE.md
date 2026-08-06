@@ -27,10 +27,12 @@ test/
 ├── integration/          # Integration tests
 │   └── setup_test.exs
 └── test_helper.exs       # Test configuration
+```
 
 ## Running Tests
 
 ### All Tests
+
 ```bash
 mix test
 ```

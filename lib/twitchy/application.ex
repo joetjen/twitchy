@@ -2,7 +2,8 @@ defmodule Twitchy.Application do
   @moduledoc """
   The Twitchy Application.
 
-  Supervises the default Finch pool for HTTP connections to the Twitch API.
+  Supervises the default Finch pool for HTTP connections to the Twitch API,
+  and the default in-memory token store (`Twitchy.TokenStore.Memory`).
   Custom Finch pools can be specified per client instance using `Twitchy.with_finch_pool/2`.
   """
 
@@ -24,6 +25,7 @@ defmodule Twitchy.Application do
            ]
          ]
        }},
+      Twitchy.TokenStore.Memory,
       Twitchy.EventSub.Supervisor
     ]
 
