@@ -10,10 +10,10 @@ defmodule Twitchy.Integration.SetupTest do
   @twitch_client_secret System.get_env("TWITCH_CLIENT_SECRET")
 
   setup_all do
-    unless @twitch_client_id && @twitch_client_secret do
-      :skip
-    else
+    if @twitch_client_id && @twitch_client_secret do
       {:ok, client_id: @twitch_client_id, client_secret: @twitch_client_secret}
+    else
+      :skip
     end
   end
 

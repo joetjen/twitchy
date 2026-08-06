@@ -20,7 +20,8 @@ defmodule Twitchy.MixProject do
         coveralls: :test,
         "coveralls.detail": :test,
         "coveralls.post": :test,
-        "coveralls.html": :test
+        "coveralls.html": :test,
+        precommit: :test
       ],
       aliases: aliases(),
       dialyzer: [
@@ -76,7 +77,7 @@ defmodule Twitchy.MixProject do
   defp package do
     [
       name: "twitchy",
-      licenses: ["Apache-2.0"],
+      licenses: ["MIT"],
       links: %{
         "GitHub" => "https://github.com/joetjen/twitchy"
       }
@@ -91,9 +92,14 @@ defmodule Twitchy.MixProject do
       extras: [
         "README.md",
         "QUICKSTART.md",
+        "TUTORIAL.md",
         "USAGE_GUIDE.md",
         "EXAMPLES.md",
+        "EVENTSUB_EXAMPLES.md",
+        "TESTING_GUIDE.md",
         "CHANGELOG.md",
+        "LICENSE",
+        "docs/api/API_REFERENCE.md",
         "docs/api/USERS_STREAMS.md",
         "docs/api/CHANNELS_GAMES.md",
         "docs/api/VIDEOS_CLIPS.md",
@@ -104,7 +110,8 @@ defmodule Twitchy.MixProject do
         "docs/api/ANALYTICS_SEARCH_ADS_MISC.md"
       ],
       groups_for_extras: [
-        Guides: ~r/^(README|QUICKSTART|USAGE_GUIDE|EXAMPLES|CHANGELOG)/,
+        Guides:
+          ~r/^(README|QUICKSTART|TUTORIAL|USAGE_GUIDE|EXAMPLES|EVENTSUB_EXAMPLES|TESTING_GUIDE|CHANGELOG|LICENSE)/,
         "API Documentation": ~r/^docs\/api/
       ]
     ]

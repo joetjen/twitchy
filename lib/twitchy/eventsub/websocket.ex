@@ -431,13 +431,11 @@ defmodule Twitchy.EventSub.WebSocket do
   end
 
   defp dispatch_event(event, %{handler: {module, function, args}}) do
-    try do
-      apply(module, function, [event | args])
-    rescue
-      error ->
-        Logger.error("Error in EventSub handler: #{inspect(error)}")
-        Logger.error(Exception.format_stacktrace(__STACKTRACE__))
-    end
+    apply(module, function, [event | args])
+  rescue
+    error ->
+      Logger.error("Error in EventSub handler: #{inspect(error)}")
+      Logger.error(Exception.format_stacktrace(__STACKTRACE__))
   end
 
   defp dispatch_event(event, %{handler: pid}) when is_pid(pid) do

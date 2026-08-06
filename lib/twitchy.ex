@@ -95,6 +95,8 @@ defmodule Twitchy do
   - `:refresh_token` - Pre-existing refresh token (optional)
   - `:token_type` - Token type (`:app_access` or `:user_access`)
   - `:base_url` - API base URL (default: "https://api.twitch.tv/helix")
+  - `:auth_base_url` - OAuth base URL (default: "https://id.twitch.tv/oauth2"); override to point
+    authentication requests at a mock server (e.g. in tests)
   - `:timeout` - Request timeout in milliseconds (default: 30_000)
   - `:retry_attempts` - Number of retry attempts (default: 3)
   - `:finch_pool` - Finch pool name (default: `Twitchy.Finch`)

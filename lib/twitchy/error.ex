@@ -58,6 +58,12 @@ defmodule Twitchy.Error do
             reason: atom() | String.t(),
             status: integer() | nil
           }
+
+    @impl true
+    def message(%__MODULE__{} = error) do
+      base = error.message || "Authentication error"
+      if error.reason, do: "#{base}: #{error.reason}", else: base
+    end
   end
 
   defmodule RateLimitError do
@@ -77,7 +83,7 @@ defmodule Twitchy.Error do
 
     @impl true
     def message(%__MODULE__{} = error) do
-      base = "Rate limit exceeded"
+      base = error.message || "Rate limit exceeded"
 
       if error.reset_at do
         "#{base}. Resets at #{DateTime.to_iso8601(error.reset_at)}"
@@ -142,7 +148,7 @@ defmodule Twitchy.Error do
   def normalize({:error, %{status: 401} = error}) do
     %AuthError{
       message: "Authentication failed",
-      reason: get_in(error, [:body, "message"]) || get_in(error, [:body, "error"]) || "Unauthorized",
+      reason: body_value(error[:body], "message") || body_value(error[:body], "error") || "Unauthorized",
       status: 401
     }
   end
@@ -150,7 +156,7 @@ defmodule Twitchy.Error do
   def normalize({:error, %{status: 403} = error}) do
     %AuthError{
       message: "Authorization failed",
-      reason: get_in(error, [:body, "message"]) || get_in(error, [:body, "error"]) || "Forbidden",
+      reason: body_value(error[:body], "message") || body_value(error[:body], "error") || "Forbidden",
       status: 403
     }
   end
@@ -174,8 +180,8 @@ defmodule Twitchy.Error do
     %APIError{
       message: "Client error",
       status: status,
-      error: body["error"],
-      error_message: body["message"],
+      error: body_value(body, "error"),
+      error_message: body_value(body, "message"),
       request_id: get_in(error, [:headers, "twitch-request-id"])
     }
   end
@@ -184,8 +190,8 @@ defmodule Twitchy.Error do
     %APIError{
       message: "Server error",
       status: status,
-      error: body["error"],
-      error_message: body["message"],
+      error: body_value(body, "error"),
+      error_message: body_value(body, "message"),
       request_id: get_in(error, [:headers, "twitch-request-id"])
     }
   end
@@ -217,6 +223,9 @@ defmodule Twitchy.Error do
       reason: error
     }
   end
+
+  defp body_value(body, key) when is_map(body), do: body[key]
+  defp body_value(_body, _key), do: nil
 
   defp parse_int(nil), do: nil
   defp parse_int(value) when is_integer(value), do: value

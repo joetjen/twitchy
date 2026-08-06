@@ -39,7 +39,9 @@ defmodule Twitchy.Pagination do
   ## Parameters
 
   - `fetch_page_fn` - Function that takes a cursor and returns `{:ok, items, next_cursor}`
-  - `initial_cursor` - Optional starting cursor
+  - `initial_cursor` - Optional starting cursor. Defaults to `nil`, which fetches the first
+    page (not "no more pages" — the stream only halts once a fetch returns a `nil`
+    `next_cursor` or an empty item list)
 
   ## Examples
 
@@ -60,12 +62,12 @@ defmodule Twitchy.Pagination do
   @spec stream((cursor() -> page_response()), cursor()) :: Enumerable.t()
   def stream(fetch_page_fn, initial_cursor \\ nil) do
     Stream.resource(
-      fn -> {0, 0, initial_cursor} end,
+      fn -> {0, 0, initial_cursor, :fetch} end,
       fn
-        {_page, _total, nil} ->
+        {_page, _total, _cursor, :halt} ->
           {:halt, nil}
 
-        {page_num, total_fetched, cursor} ->
+        {page_num, total_fetched, cursor, :fetch} ->
           start_time = System.monotonic_time()
 
           case fetch_page_fn.(cursor) do
@@ -73,22 +75,7 @@ defmodule Twitchy.Pagination do
               {:halt, nil}
 
             {:ok, items, next_cursor} ->
-              page_num = page_num + 1
-              total_fetched = total_fetched + length(items)
-
-              duration = System.monotonic_time() - start_time
-
-              :telemetry.execute(
-                [:twitchy, :pagination, :fetch],
-                %{duration: duration, count: length(items)},
-                %{
-                  cursor: cursor,
-                  page_number: page_num,
-                  total_fetched: total_fetched
-                }
-              )
-
-              {items, {page_num, total_fetched, next_cursor}}
+              handle_page(items, next_cursor, page_num, total_fetched, cursor, start_time)
 
             {:error, reason} ->
               raise "Pagination error: #{inspect(reason)}"
@@ -96,6 +83,26 @@ defmodule Twitchy.Pagination do
       end,
       fn _ -> :ok end
     )
+  end
+
+  defp handle_page(items, next_cursor, page_num, total_fetched, cursor, start_time) do
+    page_num = page_num + 1
+    total_fetched = total_fetched + length(items)
+    duration = System.monotonic_time() - start_time
+
+    :telemetry.execute(
+      [:twitchy, :pagination, :fetch],
+      %{duration: duration, count: length(items)},
+      %{
+        cursor: cursor,
+        page_number: page_num,
+        total_fetched: total_fetched
+      }
+    )
+
+    next_action = if is_nil(next_cursor), do: :halt, else: :fetch
+
+    {items, {page_num, total_fetched, next_cursor, next_action}}
   end
 
   @doc """
@@ -112,16 +119,14 @@ defmodule Twitchy.Pagination do
   """
   @spec fetch_all((cursor() -> page_response()), cursor()) :: {:ok, list()} | {:error, term()}
   def fetch_all(fetch_page_fn, initial_cursor \\ nil) do
-    try do
-      items =
-        fetch_page_fn
-        |> stream(initial_cursor)
-        |> Enum.to_list()
+    items =
+      fetch_page_fn
+      |> stream(initial_cursor)
+      |> Enum.to_list()
 
-      {:ok, items}
-    rescue
-      error -> {:error, error}
-    end
+    {:ok, items}
+  rescue
+    error -> {:error, error}
   end
 
   @doc """

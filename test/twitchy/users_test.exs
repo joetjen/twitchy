@@ -59,10 +59,9 @@ defmodule Twitchy.UsersTest do
       response = mock_api_response([user])
 
       Bypass.expect_once(bypass, "PUT", "/users", fn conn ->
-        {:ok, body, conn} = Plug.Conn.read_body(conn)
-        params = Jason.decode!(body)
+        conn = Plug.Conn.fetch_query_params(conn)
 
-        assert params["description"] == "New description"
+        assert conn.query_params["description"] == "New description"
 
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
@@ -86,7 +85,7 @@ defmodule Twitchy.UsersTest do
     test "unblocks user", %{bypass: bypass, client: client} do
       expect_helix_delete(bypass, "/users/blocks")
 
-      assert :ok = Users.unblock_user(client, target_user_id: "67890")
+      assert :ok = Users.unblock_user(client, "67890")
     end
   end
 

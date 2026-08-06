@@ -60,16 +60,17 @@ defmodule Twitchy.Users do
   Gets a single user by login name.
 
   Convenience function that extracts the first user from the response.
+  Returns `{:error, :user_not_found}` if no user matches.
 
   ## Examples
 
       {:ok, user} = Twitchy.Users.get_user(client, login: "shroud")
   """
-  @spec get_user(Twitchy.t(), keyword()) :: {:ok, map() | nil} | {:error, Exception.t()}
+  @spec get_user(Twitchy.t(), keyword()) :: {:ok, map()} | {:error, :user_not_found | Exception.t()}
   def get_user(client, params) do
     case get_users(client, params) do
       {:ok, %{"data" => [user | _]}} -> {:ok, user}
-      {:ok, %{"data" => []}} -> {:ok, nil}
+      {:ok, %{"data" => []}} -> {:error, :user_not_found}
       error -> error
     end
   end

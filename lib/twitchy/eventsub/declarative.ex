@@ -58,6 +58,7 @@ defmodule Twitchy.EventSub.Declarative do
   require Logger
 
   alias Twitchy.EventSub
+  alias Twitchy.EventSub.WebSocket
 
   defstruct [
     :name,
@@ -252,7 +253,7 @@ defmodule Twitchy.EventSub.Declarative do
 
     # Stop WebSocket connection
     if state.websocket_pid do
-      Twitchy.EventSub.WebSocket.close(state.websocket_pid)
+      WebSocket.close(state.websocket_pid)
     end
 
     :ok
@@ -314,94 +315,110 @@ defmodule Twitchy.EventSub.Declarative do
     # Fetch current subscriptions from API
     case EventSub.get_subscriptions(state.client) do
       {:ok, response} ->
-        api_subscriptions = response["data"] || []
-
-        # Filter to only websocket subscriptions for this session
-        actual_subscriptions =
-          Enum.filter(api_subscriptions, fn sub ->
-            get_in(sub, ["transport", "method"]) == "websocket" &&
-              get_in(sub, ["transport", "session_id"]) == state.session_id
-          end)
-
-        state = %{state | actual_subscriptions: actual_subscriptions}
-
-        # Determine what needs to be created and deleted
-        {to_create, to_delete} = diff_subscriptions(state.desired_subscriptions, actual_subscriptions)
-
-        # Delete obsolete subscriptions
-        Enum.each(to_delete, fn sub ->
-          Logger.info("Deleting subscription: #{sub["type"]} (#{sub["id"]})")
-
-          case EventSub.delete_subscription(state.client, id: sub["id"]) do
-            :ok ->
-              emit_telemetry(:subscription_deleted, %{subscription_id: sub["id"]}, state)
-
-            {:error, reason} ->
-              Logger.error("Failed to delete subscription: #{inspect(reason)}")
-              emit_telemetry(:error, %{reason: reason, action: :delete}, state)
-          end
-        end)
-
-        # Create new subscriptions
-        pending =
-          Enum.map(to_create, fn desired ->
-            Logger.info("Creating subscription: #{desired["type"]}")
-
-            transport = %{
-              method: "websocket",
-              session_id: state.session_id
-            }
-
-            params = [
-              type: desired["type"],
-              version: desired["version"],
-              condition: desired["condition"],
-              transport: transport
-            ]
-
-            case EventSub.create_subscription(state.client, params) do
-              {:ok, response} ->
-                subscription = response["data"] |> List.first()
-                emit_telemetry(:subscription_created, %{subscription_id: subscription["id"]}, state)
-                {:ok, subscription}
-
-              {:error, reason} ->
-                Logger.error("Failed to create subscription: #{inspect(reason)}")
-                emit_telemetry(:error, %{reason: reason, action: :create}, state)
-                {:error, desired}
-            end
-          end)
-
-        # Update state with pending/failed subscriptions
-        newly_created =
-          Enum.flat_map(pending, fn
-            {:ok, sub} -> [sub]
-            _ -> []
-          end)
-
-        failed =
-          Enum.flat_map(pending, fn
-            {:error, desired} -> [desired]
-            _ -> []
-          end)
-
-        state = %{
-          state
-          | actual_subscriptions: actual_subscriptions ++ newly_created,
-            pending_subscriptions: failed
-        }
-
-        # Schedule retry if there are failed subscriptions
-        if length(failed) > 0 do
-          Process.send_after(self(), :reconcile, 5_000)
-        end
-
-        state
+        reconcile_with_api_subscriptions(state, response["data"] || [])
 
       {:error, reason} ->
         Logger.error("Failed to fetch subscriptions: #{inspect(reason)}")
         state
     end
+  end
+
+  defp reconcile_with_api_subscriptions(state, api_subscriptions) do
+    # Filter to only websocket subscriptions for this session
+    actual_subscriptions =
+      Enum.filter(api_subscriptions, fn sub ->
+        get_in(sub, ["transport", "method"]) == "websocket" &&
+          get_in(sub, ["transport", "session_id"]) == state.session_id
+      end)
+
+    state = %{state | actual_subscriptions: actual_subscriptions}
+
+    # Determine what needs to be created and deleted
+    {to_create, to_delete} = diff_subscriptions(state.desired_subscriptions, actual_subscriptions)
+
+    delete_subscriptions(to_delete, state)
+
+    {newly_created, failed} = create_subscriptions(to_create, state)
+
+    state = %{
+      state
+      | actual_subscriptions: actual_subscriptions ++ newly_created,
+        pending_subscriptions: failed
+    }
+
+    # Schedule retry if there are failed subscriptions
+    if failed != [] do
+      Process.send_after(self(), :reconcile, 5_000)
+    end
+
+    state
+  end
+
+  defp delete_subscriptions(to_delete, state) do
+    Enum.each(to_delete, fn sub ->
+      Logger.info("Deleting subscription: #{sub["type"]} (#{sub["id"]})")
+
+      EventSub.delete_subscription(state.client, id: sub["id"])
+      |> handle_delete_result(sub, state)
+    end)
+  end
+
+  defp handle_delete_result(:ok, sub, state) do
+    emit_telemetry(:subscription_deleted, %{subscription_id: sub["id"]}, state)
+  end
+
+  defp handle_delete_result({:error, reason}, _sub, state) do
+    Logger.error("Failed to delete subscription: #{inspect(reason)}")
+    emit_telemetry(:error, %{reason: reason, action: :delete}, state)
+  end
+
+  defp create_subscriptions(to_create, state) do
+    pending = Enum.map(to_create, &create_subscription(&1, state))
+
+    newly_created =
+      Enum.flat_map(pending, fn
+        {:ok, sub} -> [sub]
+        _ -> []
+      end)
+
+    failed =
+      Enum.flat_map(pending, fn
+        {:error, desired} -> [desired]
+        _ -> []
+      end)
+
+    {newly_created, failed}
+  end
+
+  defp create_subscription(desired, state) do
+    Logger.info("Creating subscription: #{desired["type"]}")
+
+    transport = %{
+      method: "websocket",
+      session_id: state.session_id
+    }
+
+    params = [
+      type: desired["type"],
+      version: desired["version"],
+      condition: desired["condition"],
+      transport: transport
+    ]
+
+    EventSub.create_subscription(state.client, params)
+    |> handle_create_result(desired, state)
+  end
+
+  defp handle_create_result({:ok, response}, _desired, state) do
+    subscription = response["data"] |> List.first()
+    emit_telemetry(:subscription_created, %{subscription_id: subscription["id"]}, state)
+    {:ok, subscription}
+  end
+
+  defp handle_create_result({:error, reason}, desired, state) do
+    Logger.error("Failed to create subscription: #{inspect(reason)}")
+    emit_telemetry(:error, %{reason: reason, action: :create}, state)
+    {:error, desired}
   end
 
   defp diff_subscriptions(desired, actual) do

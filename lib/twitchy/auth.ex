@@ -41,10 +41,10 @@ defmodule Twitchy.Auth do
   alias Twitchy.{Config, Error}
   require Logger
 
-  @auth_base_url "https://id.twitch.tv/oauth2"
-  @token_url "#{@auth_base_url}/token"
-  @authorize_url "#{@auth_base_url}/authorize"
-  @validate_url "#{@auth_base_url}/validate"
+  defp token_url(config), do: "#{config.auth_base_url}/token"
+  defp authorize_url(config), do: "#{config.auth_base_url}/authorize"
+  defp validate_url(config), do: "#{config.auth_base_url}/validate"
+  defp revoke_url(config), do: "#{config.auth_base_url}/revoke"
 
   @doc """
   Obtains an app access token using the Client Credentials flow.
@@ -59,38 +59,35 @@ defmodule Twitchy.Auth do
   """
   @spec get_app_access_token(Config.t()) :: {:ok, Config.t()} | {:error, Exception.t()}
   def get_app_access_token(%Config{} = config) do
-    with :ok <- Config.validate(config, :app_auth) do
-      metadata = %{
-        token_type: :app_access,
-        client_id: config.client_id
-      }
+    case Config.validate(config, :app_auth) do
+      :ok ->
+        metadata = %{
+          token_type: :app_access,
+          client_id: config.client_id
+        }
 
-      :telemetry.span(
-        [:twitchy, :auth, :token],
-        metadata,
-        fn ->
-          result = do_get_app_access_token(config)
+        :telemetry.span(
+          [:twitchy, :auth, :token],
+          metadata,
+          fn ->
+            result = do_get_app_access_token(config)
+            {result, merge_token_metadata(result, metadata)}
+          end
+        )
 
-          metadata =
-            case result do
-              {:ok, new_config} ->
-                Map.merge(metadata, %{
-                  expires_in: calculate_expires_in(new_config.expires_at),
-                  scopes: new_config.scopes
-                })
-
-              {:error, _} ->
-                metadata
-            end
-
-          {result, metadata}
-        end
-      )
-    else
       {:error, reason} ->
         {:error, %Error.ValidationError{message: reason}}
     end
   end
+
+  defp merge_token_metadata({:ok, new_config}, metadata) do
+    Map.merge(metadata, %{
+      expires_in: calculate_expires_in(new_config.expires_at),
+      scopes: new_config.scopes
+    })
+  end
+
+  defp merge_token_metadata({:error, _}, metadata), do: metadata
 
   defp do_get_app_access_token(config) do
     body = %{
@@ -99,7 +96,7 @@ defmodule Twitchy.Auth do
       grant_type: "client_credentials"
     }
 
-    case Req.post(@token_url, json: body) do
+    case Req.post(token_url(config), json: body) do
       {:ok, %{status: 200, body: response}} ->
         config =
           Config.put_token(config, response["access_token"],
@@ -172,7 +169,7 @@ defmodule Twitchy.Auth do
       end
 
     query = URI.encode_query(params)
-    "#{@authorize_url}?#{query}"
+    "#{authorize_url(config)}?#{query}"
   end
 
   @doc """
@@ -189,34 +186,22 @@ defmodule Twitchy.Auth do
   """
   @spec exchange_code(Config.t(), String.t()) :: {:ok, Config.t()} | {:error, Exception.t()}
   def exchange_code(%Config{} = config, code) do
-    with :ok <- Config.validate(config, :user_auth) do
-      metadata = %{
-        token_type: :user_access,
-        client_id: config.client_id
-      }
+    case Config.validate(config, :user_auth) do
+      :ok ->
+        metadata = %{
+          token_type: :user_access,
+          client_id: config.client_id
+        }
 
-      :telemetry.span(
-        [:twitchy, :auth, :token],
-        metadata,
-        fn ->
-          result = do_exchange_code(config, code)
+        :telemetry.span(
+          [:twitchy, :auth, :token],
+          metadata,
+          fn ->
+            result = do_exchange_code(config, code)
+            {result, merge_token_metadata(result, metadata)}
+          end
+        )
 
-          metadata =
-            case result do
-              {:ok, new_config} ->
-                Map.merge(metadata, %{
-                  expires_in: calculate_expires_in(new_config.expires_at),
-                  scopes: new_config.scopes
-                })
-
-              {:error, _} ->
-                metadata
-            end
-
-          {result, metadata}
-        end
-      )
-    else
       {:error, reason} ->
         {:error, %Error.ValidationError{message: reason}}
     end
@@ -231,7 +216,7 @@ defmodule Twitchy.Auth do
       redirect_uri: config.redirect_uri
     }
 
-    case Req.post(@token_url, form: body) do
+    case Req.post(token_url(config), form: body) do
       {:ok, %{status: 200, body: response}} ->
         config =
           Config.put_token(config, response["access_token"],
@@ -290,20 +275,7 @@ defmodule Twitchy.Auth do
       metadata,
       fn ->
         result = do_refresh_token(config)
-
-        metadata =
-          case result do
-            {:ok, new_config} ->
-              Map.merge(metadata, %{
-                expires_in: calculate_expires_in(new_config.expires_at),
-                scopes: new_config.scopes
-              })
-
-            {:error, _} ->
-              metadata
-          end
-
-        {result, metadata}
+        {result, merge_token_metadata(result, metadata)}
       end
     )
   end
@@ -316,7 +288,7 @@ defmodule Twitchy.Auth do
       refresh_token: config.refresh_token
     }
 
-    case Req.post(@token_url, json: body) do
+    case Req.post(token_url(config), json: body) do
       {:ok, %{status: 200, body: response}} ->
         config =
           Config.put_token(config, response["access_token"],
@@ -371,7 +343,7 @@ defmodule Twitchy.Auth do
   def validate_token(%Config{} = config) do
     headers = [{"Authorization", "OAuth #{config.access_token}"}]
 
-    case Req.get(@validate_url, headers: headers) do
+    case Req.get(validate_url(config), headers: headers) do
       {:ok, %{status: 200, body: body}} ->
         {:ok, body}
 
@@ -412,7 +384,7 @@ defmodule Twitchy.Auth do
       token: config.access_token
     }
 
-    case Req.post("#{@auth_base_url}/revoke", json: body) do
+    case Req.post(revoke_url(config), json: body) do
       {:ok, %{status: 200}} ->
         # Remove from token store if configured
         if config.token_store && config.client_id do
