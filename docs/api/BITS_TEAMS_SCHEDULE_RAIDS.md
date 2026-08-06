@@ -87,10 +87,10 @@ Get information about a specific team.
 
 ```elixir
 # By team name
-{:ok, response} = Twitchy.Teams.get_team(client, name: "team_name")
+{:ok, response} = Twitchy.Teams.get_teams(client, name: "team_name")
 
 # By team ID
-{:ok, response} = Twitchy.Teams.get_team(client, id: "team_id")
+{:ok, response} = Twitchy.Teams.get_teams(client, id: "team_id")
 
 team = List.first(response["data"])
 IO.puts("Team: #{team["team_display_name"]}")
@@ -165,7 +165,7 @@ Manage schedule segments (requires `channel:manage:schedule` scope).
 )
 
 # Delete segment
-{:ok, _} = Twitchy.Schedule.delete_channel_stream_schedule_segment(client,
+:ok = Twitchy.Schedule.delete_channel_stream_schedule_segment(client,
   broadcaster_id: "123456",
   id: "segment_id"
 )
@@ -178,15 +178,12 @@ Manage schedule segments (requires `channel:manage:schedule` scope).
 Raid another channel (requires `channel:manage:raids` scope).
 
 ```elixir
-{:ok, response} = Twitchy.Raids.start_raid(client,
+:ok = Twitchy.Raids.start_raid(client,
   from_broadcaster_id: "123456",
   to_broadcaster_id: "789"
 )
 
-raid = List.first(response["data"])
 IO.puts("Raid started!")
-IO.puts("  Created at: #{raid["created_at"]}")
-IO.puts("  Mature audience: #{raid["is_mature"]}")
 ```
 
 ### Cancel Raid
@@ -194,7 +191,7 @@ IO.puts("  Mature audience: #{raid["is_mature"]}")
 Cancel a pending raid.
 
 ```elixir
-{:ok, _} = Twitchy.Raids.cancel_raid(client,
+:ok = Twitchy.Raids.cancel_raid(client,
   broadcaster_id: "123456"
 )
 
@@ -476,7 +473,7 @@ defmodule MyApp.RaidCoordinator do
       from_broadcaster_id: from_id,
       to_broadcaster_id: to_id
     ) do
-      {:ok, _} ->
+      :ok ->
         IO.puts("✅ Raid started successfully!")
         :ok
 
@@ -513,6 +510,244 @@ case targets do
     IO.puts("No suitable raid targets found")
 end
 ```
+
+## Tutorial
+
+### Build a Stream Schedule & End-of-Stream Raid Tool
+
+This tutorial builds a small script that follows one stream through its
+lifecycle: before going live it adds this week's slot to the channel's
+schedule, while live it checks the Bits leaderboard so you can shout out the
+top cheerer, and when signing off it raids a friend's channel to send viewers
+their way. It's a compact tour of three APIs that each own a different moment
+of a broadcast — planning, in-stream engagement, and hand-off.
+
+### Step 1: Authenticate with the Right Scopes
+
+Each part of the tool needs its own scope: `channel:manage:schedule` to write
+to the schedule, `bits:read` to read the leaderboard, and
+`channel:manage:raids` to start a raid. Request all three up front so the
+resulting user token can drive the whole script:
+
+```elixir
+client =
+  Twitchy.new(
+    client_id: System.fetch_env!("TWITCH_CLIENT_ID"),
+    client_secret: System.fetch_env!("TWITCH_CLIENT_SECRET"),
+    redirect_uri: "http://localhost:4000/auth/callback"
+  )
+
+auth_url =
+  Twitchy.auth_url(client, [
+    "channel:manage:schedule",
+    "bits:read",
+    "channel:manage:raids"
+  ])
+
+IO.puts(auth_url)
+```
+
+Open the URL, authorize as the broadcaster, and exchange the returned `code`
+for a token exactly as in
+[TUTORIAL.md](../../TUTORIAL.md#step-2-get-a-user-access-token-for-the-broadcaster):
+
+```elixir
+{:ok, client} = Twitchy.authenticate(client, :user_access, code: "the_code_from_the_redirect")
+```
+
+Save `client.refresh_token` so future runs of the script can call
+`Twitchy.refresh_token/1` instead of repeating the browser flow.
+
+### Step 2: Look Up the Broadcaster
+
+Every call below needs the broadcaster's user ID:
+
+```elixir
+{:ok, broadcaster} = Twitchy.Users.get_user(client, login: "your_channel_name")
+broadcaster_id = broadcaster["id"]
+```
+
+### Step 3: Add This Week's Stream to the Schedule
+
+`Twitchy.Schedule.create_channel_stream_schedule_segment/2` requires
+`broadcaster_id`, `start_time` (RFC3339), `timezone` (IANA), and `duration`
+(minutes, as a string, max `1440`); `category_id`, `title`, and
+`is_recurring` are optional but worth setting so the segment is useful to
+viewers browsing the schedule:
+
+```elixir
+{:ok, _response} =
+  Twitchy.Schedule.create_channel_stream_schedule_segment(client,
+    broadcaster_id: broadcaster_id,
+    start_time: "2026-08-14T20:00:00Z",
+    timezone: "America/New_York",
+    duration: "180",
+    is_recurring: false,
+    category_id: "509658",
+    title: "Friday Night Stream"
+  )
+
+IO.puts("Scheduled Friday Night Stream")
+```
+
+Computing "this Friday at 8pm" instead of hardcoding a date is just date
+math — the complete example below wraps it in a small helper so it can be
+called on any day of the week.
+
+### Step 4: Shout Out the Top Cheerer Mid-Stream
+
+`Twitchy.Bits.get_bits_leaderboard/2` requires the `bits:read` scope and
+accepts `:count` and `:period` (one of `:day`, `:week`, `:month`, `:year`,
+`:all`). Asking for `count: 1, period: :day` gets today's single top cheerer
+— cheap enough to poll every few minutes during a stream:
+
+```elixir
+case Twitchy.Bits.get_bits_leaderboard(client, count: 1, period: :day) do
+  {:ok, %{"data" => [top | _]}} ->
+    IO.puts("🎉 Today's top cheerer: #{top["user_name"]} with #{top["score"]} bits!")
+
+  {:ok, %{"data" => []}} ->
+    IO.puts("No cheers yet today.")
+
+  {:error, error} ->
+    IO.puts("Couldn't fetch leaderboard: #{Exception.message(error)}")
+end
+```
+
+An empty `"data"` list is the normal case early in a stream, not an error —
+match it explicitly rather than assuming there's always a leader.
+
+### Step 5: Raid a Friend When Signing Off
+
+`Twitchy.Raids.start_raid/2` requires `channel:manage:raids` and takes
+`:from_broadcaster_id` and `:to_broadcaster_id`. Unlike most Twitchy calls it
+returns a bare `:ok` rather than `{:ok, response}` — there's no response body
+to unpack:
+
+```elixir
+{:ok, friend} = Twitchy.Users.get_user(client, login: "a_friend_channel")
+
+case Twitchy.Raids.start_raid(client,
+       from_broadcaster_id: broadcaster_id,
+       to_broadcaster_id: friend["id"]
+     ) do
+  :ok -> IO.puts("🚀 Raiding #{friend["display_name"]}!")
+  {:error, error} -> IO.puts("Raid failed: #{Exception.message(error)}")
+end
+```
+
+### The Complete Example
+
+Everything above assembled into a small module plus a script that drives it.
+Drop the module into `lib/my_app/schedule_and_raid_tool.ex` in a project with
+`:twitchy` as a dependency:
+
+```elixir
+defmodule MyApp.ScheduleAndRaidTool do
+  @moduledoc """
+  A stream-lifecycle helper: add this week's slot to the schedule before
+  going live, shout out the top cheerer while live, and raid a friend when
+  signing off.
+  """
+
+  require Logger
+
+  @doc "Adds this week's stream to the broadcaster's schedule."
+  def schedule_this_week(client, broadcaster_id, opts \\ []) do
+    weekday = Keyword.get(opts, :weekday, 5)
+    hour = Keyword.get(opts, :hour, 20)
+    title = Keyword.get(opts, :title, "Weekly Stream")
+
+    Twitchy.Schedule.create_channel_stream_schedule_segment(client,
+      broadcaster_id: broadcaster_id,
+      start_time: next_occurrence(weekday, hour, 0),
+      timezone: "America/New_York",
+      duration: "180",
+      is_recurring: false,
+      category_id: "509658",
+      title: title
+    )
+  end
+
+  @doc "Logs a shoutout for today's top cheerer, if there is one."
+  def shoutout_top_cheerer(client) do
+    case Twitchy.Bits.get_bits_leaderboard(client, count: 1, period: :day) do
+      {:ok, %{"data" => [top | _]}} ->
+        IO.puts("🎉 Today's top cheerer: #{top["user_name"]} with #{top["score"]} bits!")
+        :ok
+
+      {:ok, %{"data" => []}} ->
+        IO.puts("No cheers yet today.")
+        :ok
+
+      {:error, error} ->
+        Logger.warning("Couldn't fetch leaderboard: #{Exception.message(error)}")
+        {:error, error}
+    end
+  end
+
+  @doc "Raids a friend's channel when signing off."
+  def raid_friend(client, broadcaster_id, friend_login) do
+    with {:ok, friend} <- Twitchy.Users.get_user(client, login: friend_login),
+         :ok <-
+           Twitchy.Raids.start_raid(client,
+             from_broadcaster_id: broadcaster_id,
+             to_broadcaster_id: friend["id"]
+           ) do
+      IO.puts("🚀 Raiding #{friend["display_name"]}!")
+      :ok
+    else
+      {:error, error} ->
+        Logger.warning("Raid failed: #{Exception.message(error)}")
+        {:error, error}
+    end
+  end
+
+  defp next_occurrence(weekday, hour, minute) do
+    today = Date.utc_today()
+    days_ahead = rem(weekday - Date.day_of_week(today) + 7, 7)
+    days_ahead = if days_ahead == 0, do: 7, else: days_ahead
+
+    today
+    |> Date.add(days_ahead)
+    |> DateTime.new!(Time.new!(hour, minute, 0), "Etc/UTC")
+    |> DateTime.to_iso8601()
+  end
+end
+```
+
+And the script that drives it across a stream's lifecycle:
+
+```elixir
+# schedule_and_raid.exs — run with: mix run schedule_and_raid.exs
+client =
+  Twitchy.new(
+    client_id: System.fetch_env!("TWITCH_CLIENT_ID"),
+    client_secret: System.fetch_env!("TWITCH_CLIENT_SECRET"),
+    refresh_token: System.fetch_env!("TWITCH_REFRESH_TOKEN")
+  )
+
+{:ok, client} = Twitchy.refresh_token(client)
+
+{:ok, broadcaster} =
+  Twitchy.Users.get_user(client, login: System.fetch_env!("TWITCH_BROADCASTER_LOGIN"))
+
+broadcaster_id = broadcaster["id"]
+
+# Run before going live
+{:ok, _} = MyApp.ScheduleAndRaidTool.schedule_this_week(client, broadcaster_id, title: "Friday Night Stream")
+
+# Run periodically while live
+MyApp.ScheduleAndRaidTool.shoutout_top_cheerer(client)
+
+# Run when signing off
+MyApp.ScheduleAndRaidTool.raid_friend(client, broadcaster_id, "a_friend_channel")
+```
+
+Each function stands on its own, so a real bot would call
+`schedule_this_week/3` from a startup task, `shoutout_top_cheerer/1` from a
+timer, and `raid_friend/3` from a "going offline" hook — there's no need to
+run all three in one process just because this script does.
 
 ## Best Practices
 

@@ -299,5 +299,5 @@ results = Task.await_many(tasks, 5000)
 
 - [Quick Start Guide](QUICKSTART.md)
 - [Examples](EXAMPLES.md)
-- [API Documentation](docs/api/)
+- [API Documentation](docs/api/API_REFERENCE.md)
 - [EventSub Examples](EVENTSUB_EXAMPLES.md)

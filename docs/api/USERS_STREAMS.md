@@ -71,7 +71,7 @@ Update the authenticated user's description:
 ### Get User Followers
 
 ```elixir
-{:ok, response} = Twitchy.Users.get_followers(client,
+{:ok, response} = Twitchy.Users.get_channel_followers(client,
   broadcaster_id: "12345",
   first: 100
 )
@@ -92,7 +92,7 @@ client
 Get channels that a user follows:
 
 ```elixir
-{:ok, response} = Twitchy.Users.get_followed_channels(client,
+{:ok, response} = Twitchy.Users.get_channel_followed(client,
   user_id: "12345",
   first: 100
 )
@@ -102,14 +102,10 @@ Get channels that a user follows:
 
 ```elixir
 # Block user (requires user:manage:blocked_users scope)
-:ok = Twitchy.Users.block_user(client,
-  target_user_id: "98765",
-  source_context: "chat",
-  reason: "spam"
-)
+:ok = Twitchy.Users.block_user(client, "98765", source_context: :chat, reason: :spam)
 
 # Unblock user
-:ok = Twitchy.Users.unblock_user(client, target_user_id: "98765")
+:ok = Twitchy.Users.unblock_user(client, "98765")
 ```
 
 ### Get Blocked Users
@@ -212,12 +208,22 @@ Get live streams from channels the user follows:
   user_id: "12345"
 )
 
-# Stream all followed live streams
-client
-|> Twitchy.Streams.stream_followed_streams(user_id: "12345")
-|> Enum.each(fn stream ->
+# Page through followed live streams with `:after`
+{:ok, %{"data" => streams, "pagination" => pagination}} =
+  Twitchy.Streams.get_followed_streams(client, user_id: "12345", first: 100)
+
+Enum.each(streams, fn stream ->
   IO.puts("#{stream["user_name"]} is live: #{stream["title"]}")
 end)
+
+# Fetch the next page using the cursor, if there is one
+case pagination do
+  %{"cursor" => cursor} ->
+    Twitchy.Streams.get_followed_streams(client, user_id: "12345", first: 100, after: cursor)
+
+  _ ->
+    :done
+end
 ```
 
 ### Create Stream Marker
@@ -317,8 +323,8 @@ defmodule MyApp.UserProfile do
   def fetch_full_profile(client, username) do
     with {:ok, user} <- Twitchy.Users.get_user(client, login: username),
          {:ok, stream_resp} <- Twitchy.Streams.get_streams(client, user_id: [user["id"]]),
-         {:ok, followers} <- Twitchy.Users.get_followers(client, broadcaster_id: user["id"], first: 1),
-         {:ok, following} <- Twitchy.Users.get_followed_channels(client, user_id: user["id"], first: 1) do
+         {:ok, followers} <- Twitchy.Users.get_channel_followers(client, broadcaster_id: user["id"], first: 1),
+         {:ok, following} <- Twitchy.Users.get_channel_followed(client, user_id: user["id"], first: 1) do
 
       stream = List.first(stream_resp["data"])
 
@@ -420,6 +426,220 @@ Enum.each(stats, fn stat ->
 end)
 ```
 
+## Tutorial
+
+This walkthrough builds a small "Who's Live" tracker: a script that takes a
+list of favorite streamers' login names, checks which ones are currently live
+via the Streams API, and prints a report — then extends the idea to page
+through a channel's followers. Each step below is a small, runnable piece;
+the full script is assembled at the end.
+
+### Step 1: List Your Favorite Streamers
+
+Start with a plain list of Twitch login names (lowercase, as Twitch returns
+them):
+
+```elixir
+favorites = ["ninja", "shroud", "pokimane", "xqc"]
+```
+
+### Step 2: Check Who's Live
+
+`Twitchy.Streams.get_streams/2` accepts a list of `:user_login` values and
+returns only the channels that are currently streaming — anyone offline is
+simply absent from `"data"`, there's no per-channel "offline" entry to filter
+out:
+
+```elixir
+{:ok, response} = Twitchy.Streams.get_streams(client, user_login: favorites)
+
+live_streams = response["data"]
+```
+
+### Step 3: Work Out Who's Offline
+
+Since `get_streams/2` only returns live channels, figure out who's offline by
+diffing the requested logins against the ones that came back:
+
+```elixir
+live_logins = MapSet.new(live_streams, & &1["user_login"])
+offline_logins = Enum.reject(favorites, &MapSet.member?(live_logins, &1))
+```
+
+### Step 4: Print a Report
+
+Sort the live streams by viewer count so the biggest channel leads the
+report, then list who's offline underneath:
+
+```elixir
+live_streams
+|> Enum.sort_by(& &1["viewer_count"], :desc)
+|> Enum.each(fn stream ->
+  IO.puts("🔴 #{stream["user_name"]} — #{stream["viewer_count"]} viewers")
+  IO.puts("   #{stream["title"]}")
+end)
+
+Enum.each(offline_logins, fn login ->
+  IO.puts("⚫ #{login} is offline")
+end)
+```
+
+### Step 5: Look Up a Single Streamer On Demand
+
+For checking one login at a time — say, behind a `/live shroud` chat command
+— `Twitchy.Streams.get_stream/2` is a convenience wrapper around
+`get_streams/2` that returns the first match directly. Unlike
+`Twitchy.Users.get_user/2`, it returns `{:ok, nil}` rather than an error when
+nobody matches, because "offline" is a normal outcome here, not a failure:
+
+```elixir
+case Twitchy.Streams.get_stream(client, user_login: "shroud") do
+  {:ok, nil} -> IO.puts("shroud is offline")
+  {:ok, stream} -> IO.puts("shroud is live: #{stream["title"]}")
+  {:error, error} -> IO.puts("Error checking shroud: #{Exception.message(error)}")
+end
+```
+
+### Step 6: Resolve a Login to a User ID
+
+Paging through a channel's followers needs the broadcaster's numeric user ID,
+not their login name. `Twitchy.Users.get_user/2` resolves one from the other
+— and, as covered above, returns `{:error, :user_not_found}` for a typo'd or
+deleted login rather than `{:ok, nil}`, so that case needs its own branch:
+
+```elixir
+case Twitchy.Users.get_user(client, login: "shroud") do
+  {:ok, user} -> {:ok, user["id"]}
+  {:error, :user_not_found} -> {:error, :no_such_user}
+  {:error, error} -> {:error, error}
+end
+```
+
+### Step 7: Page Through a Channel's Followers
+
+With a broadcaster ID in hand, `Twitchy.Users.stream_followers/2` lazily
+streams pages of followers, fetching more only as the `Stream` is consumed —
+handy when you want the first N followers without pulling the entire list
+into memory:
+
+```elixir
+client
+|> Twitchy.Users.stream_followers(broadcaster_id: broadcaster_id)
+|> Stream.take(250)
+|> Enum.each(fn follower ->
+  IO.puts("#{follower["user_name"]} followed at #{follower["followed_at"]}")
+end)
+```
+
+Swap `Stream.take(250)` for `Enum.count/1` if you just want a total, or drop
+the cap entirely to walk every page — `Pagination` keeps requesting pages
+under the hood until Twitch stops returning a cursor.
+
+### The Complete Example
+
+Putting it together: a module that reports on your favorite streamers' live
+status and, for any of them, can page through their followers. Save this as
+`lib/my_app/whos_live.ex` in a project with `:twitchy` as a dependency:
+
+```elixir
+defmodule MyApp.WhosLive do
+  @moduledoc """
+  Reports which favorite streamers are currently live, and can page through
+  a channel's followers.
+  """
+
+  @doc """
+  Checks a list of logins against the Streams API and prints a live/offline
+  report, live channels first and sorted by viewer count.
+  """
+  @spec report(Twitchy.t(), [String.t()]) :: :ok
+  def report(client, favorite_logins) do
+    case Twitchy.Streams.get_streams(client, user_login: favorite_logins) do
+      {:ok, %{"data" => live_streams}} ->
+        print_report(favorite_logins, live_streams)
+
+      {:error, error} ->
+        IO.puts("Failed to fetch streams: #{Exception.message(error)}")
+    end
+
+    :ok
+  end
+
+  defp print_report(favorite_logins, live_streams) do
+    live_logins = MapSet.new(live_streams, & &1["user_login"])
+    offline_logins = Enum.reject(favorite_logins, &MapSet.member?(live_logins, &1))
+
+    live_streams
+    |> Enum.sort_by(& &1["viewer_count"], :desc)
+    |> Enum.each(fn stream ->
+      IO.puts("🔴 #{stream["user_name"]} — #{stream["viewer_count"]} viewers")
+      IO.puts("   #{stream["title"]}")
+    end)
+
+    Enum.each(offline_logins, fn login ->
+      IO.puts("⚫ #{login} is offline")
+    end)
+  end
+
+  @doc """
+  Looks up a single streamer's live status by login.
+
+  Returns `{:ok, stream}` if live, `{:ok, :offline}` if not, or `{:error,
+  reason}` on failure.
+  """
+  @spec check(Twitchy.t(), String.t()) :: {:ok, map() | :offline} | {:error, term()}
+  def check(client, login) do
+    case Twitchy.Streams.get_stream(client, user_login: login) do
+      {:ok, nil} -> {:ok, :offline}
+      {:ok, stream} -> {:ok, stream}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  @doc """
+  Prints up to `limit` followers of the given broadcaster's login.
+
+  Resolves the login to a user ID first, then pages through followers with
+  `Twitchy.Users.stream_followers/2`.
+  """
+  @spec follower_report(Twitchy.t(), String.t(), pos_integer()) :: :ok | {:error, term()}
+  def follower_report(client, broadcaster_login, limit \\ 100) do
+    case Twitchy.Users.get_user(client, login: broadcaster_login) do
+      {:ok, broadcaster} ->
+        client
+        |> Twitchy.Users.stream_followers(broadcaster_id: broadcaster["id"])
+        |> Stream.take(limit)
+        |> Enum.each(fn follower ->
+          IO.puts("#{follower["user_name"]} followed at #{follower["followed_at"]}")
+        end)
+
+        :ok
+
+      {:error, :user_not_found} ->
+        IO.puts("No such channel: #{broadcaster_login}")
+        {:error, :user_not_found}
+
+      {:error, error} ->
+        IO.puts("Failed to look up #{broadcaster_login}: #{Exception.message(error)}")
+        {:error, error}
+    end
+  end
+end
+
+# Usage
+{:ok, client} = Twitchy.authenticate(Twitchy.new(), :app_access)
+
+MyApp.WhosLive.report(client, ["ninja", "shroud", "pokimane", "xqc"])
+
+case MyApp.WhosLive.check(client, "shroud") do
+  {:ok, :offline} -> IO.puts("shroud is offline")
+  {:ok, stream} -> IO.puts("shroud is live: #{stream["title"]}")
+  {:error, error} -> IO.puts("Error: #{inspect(error)}")
+end
+
+MyApp.WhosLive.follower_report(client, "shroud", 50)
+```
+
 ## Best Practices
 
 ### Caching User Data
@@ -489,6 +709,6 @@ end
 
 ## See Also
 
-- [Channels API](CHANNELS.md)
+- [Channels & Games API](CHANNELS_GAMES.md)
 - [Videos & Clips API](VIDEOS_CLIPS.md)
-- [EventSub for real-time stream events](../EVENTSUB_EXAMPLES.md)
+- [EventSub for real-time stream events](../../EVENTSUB_EXAMPLES.md)

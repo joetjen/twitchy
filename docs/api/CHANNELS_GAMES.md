@@ -52,7 +52,7 @@ end)
 Get list of channels a user follows.
 
 ```elixir
-{:ok, response} = Twitchy.Users.get_followed_channels(client,
+{:ok, response} = Twitchy.Users.get_channel_followed(client,
   user_id: "123456",
   first: 100
 )
@@ -109,19 +109,21 @@ defmodule MyApp.TitleUpdater do
     {:ok, games_resp} = Twitchy.Games.get_games(client, name: [game_name])
     game = List.first(games_resp["data"])
 
-    return {:error, :game_not_found} unless game
+    if is_nil(game) do
+      {:error, :game_not_found}
+    else
+      # Generate title based on game
+      title = generate_title(game_name)
 
-    # Generate title based on game
-    title = generate_title(game_name)
+      # Update channel
+      {:ok, _} = Twitchy.Channels.modify_channel_information(client,
+        broadcaster_id: broadcaster_id,
+        game_id: game["id"],
+        title: title
+      )
 
-    # Update channel
-    {:ok, _} = Twitchy.Channels.modify_channel_information(client,
-      broadcaster_id: broadcaster_id,
-      game_id: game["id"],
-      title: title
-    )
-
-    {:ok, title}
+      {:ok, title}
+    end
   end
 
   defp generate_title("League of Legends"), do: "🎮 Ranked Grind - Road to Masters!"
@@ -266,6 +268,196 @@ Enum.take(streams, 10) |> Enum.each(fn stream ->
   IO.puts("  #{stream["title"]}")
   IO.puts("  https://twitch.tv/#{stream["user_login"]}\n")
 end)
+```
+
+## Tutorial
+
+### Build a Stream Setup Assistant
+
+Most broadcasters run through the same short checklist right before going
+live: pick the category, write a title that says what's happening, and check
+who's around to help moderate or hype up chat. This tutorial builds a small
+**Stream Setup Assistant** that automates that checklist: it looks up a
+game/category by name through the Games API, uses the returned ID to update
+the channel's title and category in a single call, and then lists the
+channel's current VIPs as a quick "who's here to help" check. It ties
+together everything covered above — `Twitchy.Games.get_game/2`,
+`Twitchy.Channels.modify_channel_information/2`, and
+`Twitchy.Channels.get_vips/2` — into one realistic script.
+
+**Prerequisites:** `modify_channel_information/2` requires a **user access
+token** authorized with the `channel:manage:broadcast` scope, and the bonus
+VIP-listing step requires `channel:read:vips`. See
+[TUTORIAL.md](../../TUTORIAL.md#step-2-get-a-user-access-token-for-the-broadcaster)
+for how to obtain one.
+
+### Step 1: Look Up the Category by Name
+
+`Twitchy.Games.get_game/2` is the convenience wrapper around `get_games/2` —
+it returns the first matching game, or `nil` if nothing matched. Unlike
+`Twitchy.Users.get_user/2`, a miss here is **not** an error tuple, so it has
+to be checked explicitly rather than matched away with `{:ok, _}`:
+
+```elixir
+case Twitchy.Games.get_game(client, name: "Just Chatting") do
+  {:ok, nil} ->
+    IO.puts("No category found with that name")
+
+  {:ok, game} ->
+    IO.puts("Found category: #{game["name"]} (#{game["id"]})")
+
+  {:error, error} ->
+    IO.puts("Lookup failed: #{Exception.message(error)}")
+end
+```
+
+### Step 2: Update the Title and Category Together
+
+Once we have the game's ID, `modify_channel_information/2` sets both the
+category and the title in one PATCH request. Its only required parameter is
+`:broadcaster_id` — every other key in the params list becomes part of the
+update body, so we only need to pass the fields we actually want to change:
+
+```elixir
+defp set_category_and_title(client, broadcaster_id, game, title) do
+  Twitchy.Channels.modify_channel_information(client,
+    broadcaster_id: broadcaster_id,
+    game_id: game["id"],
+    title: title
+  )
+end
+```
+
+Combining Step 1 and Step 2 with `with` handles both the "category not
+found" case and any API error from either call in one place:
+
+```elixir
+defp find_and_apply_category(client, broadcaster_id, category_name, title) do
+  with {:ok, game} <- Twitchy.Games.get_game(client, name: category_name),
+       false <- is_nil(game),
+       {:ok, _} <- set_category_and_title(client, broadcaster_id, game, title) do
+    {:ok, game}
+  else
+    true -> {:error, {:category_not_found, category_name}}
+    {:error, _} = error -> error
+  end
+end
+```
+
+### Step 3: Confirm What's Live
+
+Reading channel information back after the update confirms Twitch accepted
+it, and gives us something to print or log:
+
+```elixir
+{:ok, response} = Twitchy.Channels.get_channel_information(client, broadcaster_id: broadcaster_id)
+channel = List.first(response["data"])
+IO.puts("Now set up as: \"#{channel["title"]}\" in #{channel["game_name"]}")
+```
+
+### Step 4 (Bonus): Check Who's Here to Help
+
+Before going live, it's worth a quick glance at the channel's VIPs — the
+people most likely to help moderate chat or hype up new viewers:
+
+```elixir
+{:ok, %{"data" => vips}} = Twitchy.Channels.get_vips(client, broadcaster_id: broadcaster_id)
+
+case vips do
+  [] ->
+    IO.puts("No VIPs yet — flying solo tonight.")
+
+  vips ->
+    IO.puts("VIPs ready to help:")
+    Enum.each(vips, fn vip -> IO.puts("  - #{vip["user_name"]}") end)
+end
+```
+
+### The Complete Example
+
+Putting it together as a small module with one entry point,
+`go_live/4`, that a broadcaster (or a `mix run -e`  one-liner) can call right
+before starting a stream:
+
+```elixir
+defmodule MyApp.StreamSetupAssistant do
+  @moduledoc """
+  Pre-stream checklist: set the category and title, then report who's
+  around to help moderate or hype up chat.
+  """
+
+  require Logger
+
+  @doc """
+  Looks up `category_name`, applies it and `title` to the channel, and
+  prints the current VIP list. Returns `{:ok, game}` on success.
+  """
+  @spec go_live(Twitchy.t(), String.t(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()}
+  def go_live(client, broadcaster_id, category_name, title) do
+    with {:ok, game} <- find_category(client, category_name),
+         {:ok, _} <- update_channel(client, broadcaster_id, game, title) do
+      report_vips(client, broadcaster_id)
+      {:ok, game}
+    end
+  end
+
+  defp find_category(client, category_name) do
+    case Twitchy.Games.get_game(client, name: category_name) do
+      {:ok, nil} ->
+        {:error, {:category_not_found, category_name}}
+
+      {:ok, game} ->
+        IO.puts("Category: #{game["name"]} (#{game["id"]})")
+        {:ok, game}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp update_channel(client, broadcaster_id, game, title) do
+    case Twitchy.Channels.modify_channel_information(client,
+           broadcaster_id: broadcaster_id,
+           game_id: game["id"],
+           title: title
+         ) do
+      {:ok, _} = ok ->
+        IO.puts("Title set to: #{title}")
+        ok
+
+      {:error, error} = err ->
+        Logger.error("Failed to update channel: #{Exception.message(error)}")
+        err
+    end
+  end
+
+  defp report_vips(client, broadcaster_id) do
+    case Twitchy.Channels.get_vips(client, broadcaster_id: broadcaster_id) do
+      {:ok, %{"data" => []}} ->
+        IO.puts("No VIPs yet — flying solo tonight.")
+
+      {:ok, %{"data" => vips}} ->
+        IO.puts("VIPs ready to help:")
+        Enum.each(vips, fn vip -> IO.puts("  - #{vip["user_name"]}") end)
+
+      {:error, error} ->
+        Logger.warning("Couldn't fetch VIPs: #{Exception.message(error)}")
+    end
+  end
+end
+
+# Usage
+{:ok, client} =
+  Twitchy.new(client_id: "your_client_id", client_secret: "your_client_secret")
+  |> Twitchy.authenticate(:user_access, code: "abcdef123456")
+
+MyApp.StreamSetupAssistant.go_live(
+  client,
+  "123456",
+  "Just Chatting",
+  "Chill Sunday stream, chat's open!"
+)
 ```
 
 ## Best Practices
